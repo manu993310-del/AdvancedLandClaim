@@ -1,15 +1,11 @@
 name: AdvancedLandClaim
-version: 2.0
+version: 4.0
 main: com.custom.landclaim.LandClaimPlugin
 api-version: '26.3'
 commands:
   claim:
-    description: Manage your land claim (add, remove, blocks, unclaim)
-    usage: /claim <add|remove|blocks|unclaim>
+    description: Complete land claiming and management command
+    usage: /claim [100|chunk|gui|blocks|trust|untrust|ban|unban|kick|home|sethome|border|expand|unclaim|unclaimall|rename|info|list|giveblocks]
   claimsettings:
-    description: Open advanced claim permissions GUI menu
-    aliases: [cs, claimmenu]
-  giveclaimblocks:
-    description: Give extra claim blocks to a player (Admin)
-    permission: landclaim.admin
-    usage: /giveclaimblocks <player> <amount>
+    description: Open the Claim Control Panel GUI
+    aliases: [cs, claimgui, claimmenu]
