@@ -30,15 +30,20 @@ import java.util.*;
 
 public class LandClaimPlugin extends JavaPlugin implements Listener, TabCompleter {
 
+    private static final int STARTING_BLOCKS = 100;
+    private static final String GUI_TITLE = ChatColor.DARK_GRAY + "Claim Settings";
+    private static final String TRUST_GUI_TITLE = ChatColor.DARK_GRAY + "Trusted Players";
+    private static final String TP_GUI_TITLE = ChatColor.DARK_GRAY + "Claim Teleport";
+
     private final List<Claim> claims = new ArrayList<>();
     private final Map<UUID, Integer> playerClaimBlocks = new HashMap<>();
     private final Map<UUID, Location> corner1Map = new HashMap<>();
     private final Map<UUID, BossBar> playerBossBars = new HashMap<>();
+    private final Map<UUID, String> currentClaimId = new HashMap<>();
     private final Map<UUID, Claim> editingClaim = new HashMap<>();
 
     private File dataFile;
     private FileConfiguration dataConfig;
-    private static final int STARTING_BLOCKS = 100;
 
     @Override
     public void onEnable() {
@@ -48,15 +53,28 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         }
         loadData();
 
-        // Give +10 Claim Blocks every 6 minutes (100 blocks/hour) to online players
+        // +10 Claim Blocks every 6 minutes (100 blocks/hour)
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 addBlocks(p.getUniqueId(), 10);
-                p.sendMessage(ChatColor.GREEN + "+10 Claim Blocks earned for playing! Total: " + ChatColor.GOLD + getAvailableBlocks(p.getUniqueId()));
+                p.sendMessage(ChatColor.GREEN + "+10 Claim Blocks earned! Available: " + ChatColor.GOLD + getAvailableBlocks(p.getUniqueId()));
             }
         }, 7200L, 7200L);
 
-        getLogger().info("AdvancedLandClaim v4.0 Enabled!");
+        // ActionBar meter when holding Golden Shovel or Stick
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                Material hand = p.getInventory().getItemInMainHand().getType();
+                if (hand == Material.GOLDEN_SHOVEL || hand == Material.STICK) {
+                    Claim standing = getClaimAt(p.getLocation());
+                    String zone = (standing == null) ? ChatColor.GREEN + "Wilderness" : ChatColor.YELLOW + standing.title;
+                    p.sendActionBar(ChatColor.GOLD + "Claim Blocks: " + ChatColor.WHITE + getAvailableBlocks(p.getUniqueId())
+                            + ChatColor.DARK_GRAY + " | " + ChatColor.AQUA + "Zone: " + zone);
+                }
+            }
+        }, 20L, 20L);
+
+        getLogger().info("AdvancedLandClaim v9.0 (Premium SMP Edition) Enabled!");
     }
 
     @Override
@@ -88,6 +106,32 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         return used;
     }
 
+    private List<Claim> getPlayerClaims(UUID uuid) {
+        List<Claim> list = new ArrayList<>();
+        for (Claim c : claims) {
+            if (c.owner.equals(uuid)) list.add(c);
+        }
+        return list;
+    }
+
+    private int getNextClaimNumber(UUID uuid) {
+        int maxNum = 0;
+        for (Claim c : getPlayerClaims(uuid)) {
+            if (c.number > maxNum) {
+                maxNum = c.number;
+            }
+            if (c.title != null && c.title.toLowerCase().startsWith("claim-")) {
+                try {
+                    int parsed = Integer.parseInt(c.title.substring(6).trim());
+                    if (parsed > maxNum) {
+                        maxNum = parsed;
+                    }
+                } catch (NumberFormatException ignored) {}
+            }
+        }
+        return maxNum + 1;
+    }
+
     private Claim getClaimAt(Location loc) {
         if (loc == null || loc.getWorld() == null) return null;
         for (Claim c : claims) {
@@ -96,10 +140,13 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         return null;
     }
 
-    // --- CREATE CLAIM HELPER ---
     private boolean createClaim(Player player, Location pos1, Location pos2) {
         UUID uuid = player.getUniqueId();
+        int nextNum = getNextClaimNumber(uuid);
         Claim newClaim = new Claim(UUID.randomUUID().toString(), uuid, player.getName(), pos1, pos2);
+        newClaim.number = nextNum;
+        newClaim.title = "claim-" + nextNum;
+
         int needed = newClaim.getArea();
         int available = getAvailableBlocks(uuid);
 
@@ -115,7 +162,8 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
 
         for (Claim existing : claims) {
             if (existing.overlaps(newClaim)) {
-                player.sendMessage(ChatColor.RED + "This area overlaps with " + ChatColor.YELLOW + existing.ownerName + "'s" + ChatColor.RED + " claim!");
+                player.sendMessage(ChatColor.RED + "Already claimed! Overlaps with " + ChatColor.YELLOW + existing.ownerName + "'s" + ChatColor.RED + " claim.");
+                showClaimVisuals(player, existing);
                 return false;
             }
         }
@@ -125,509 +173,589 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         claims.add(newClaim);
         saveData();
 
-        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.8f, 1.4f);
-        showClaimBorder(player, newClaim);
-        updateBossBar(player, player.getLocation());
+        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.9f, 1.4f);
+        showClaimVisuals(player, newClaim);
+        handleZoneEntry(player, player.getLocation(), true);
 
-        player.sendMessage(ChatColor.GREEN + "Land Claimed! Size: " + ChatColor.GOLD + newClaim.getWidth() + "x" + newClaim.getLength() + " (" + needed + " blocks)" + ChatColor.GREEN + ".");
-        player.sendMessage(ChatColor.GRAY + "Remaining Claim Blocks: " + ChatColor.YELLOW + getAvailableBlocks(uuid) + ChatColor.GRAY + " | Use " + ChatColor.AQUA + "/claim gui" + ChatColor.GRAY + " for settings.");
+        player.sendMessage(ChatColor.GREEN + "Created " + ChatColor.GOLD + newClaim.title + ChatColor.GREEN + " (" + ChatColor.YELLOW + newClaim.getWidth() + "x" + newClaim.getLength() + " = " + needed + " blocks" + ChatColor.GREEN + ").");
+        player.sendMessage(ChatColor.GRAY + "Remaining Blocks: " + ChatColor.YELLOW + getAvailableBlocks(uuid) + ChatColor.GRAY + " | Use " + ChatColor.AQUA + "/claim setting" + ChatColor.GRAY + " or " + ChatColor.AQUA + "/claim tp" + ChatColor.GRAY + ".");
         return true;
     }
 
-    // --- GLOWING PARTICLE BORDER VISUALIZER ---
-    private void showClaimBorder(Player player, Claim claim) {
-        double y = player.getLocation().getY() + 1.0;
+    private void showClaimVisuals(Player player, Claim claim) {
+        World world = Bukkit.getWorld(claim.world);
+        if (world == null) return;
+
+        int[][] corners = {
+                {claim.minX, claim.minZ},
+                {claim.maxX, claim.minZ},
+                {claim.minX, claim.maxZ},
+                {claim.maxX, claim.maxZ}
+        };
+
+        List<Location> fakeBlockLocs = new ArrayList<>();
+        for (int[] c : corners) {
+            int y = world.getHighestBlockYAt(c[0], c[1]);
+            Location baseLoc = new Location(world, c[0], y, c[1]);
+            Location topLoc = new Location(world, c[0], y + 1, c[1]);
+            player.sendBlockChange(baseLoc, Material.GOLD_BLOCK.createBlockData());
+            player.sendBlockChange(topLoc, Material.GLOWSTONE.createBlockData());
+            fakeBlockLocs.add(baseLoc);
+            fakeBlockLocs.add(topLoc);
+        }
+
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!player.isOnline()) return;
+            for (Location loc : fakeBlockLocs) {
+                player.sendBlockChange(loc, loc.getBlock().getBlockData());
+            }
+        }, 300L);
+
+        double particleY = player.getLocation().getY() + 1.0;
         Bukkit.getScheduler().runTaskTimer(this, new Runnable() {
             int count = 0;
             @Override
             public void run() {
-                if (count >= 6 || !player.isOnline()) return;
+                if (count >= 8 || !player.isOnline()) return;
                 int minX = claim.minX;
                 int maxX = claim.maxX + 1;
                 int minZ = claim.minZ;
                 int maxZ = claim.maxZ + 1;
 
-                player.spawnParticle(Particle.FLAME, minX, y, minZ, 3, 0, 0.3, 0, 0);
-                player.spawnParticle(Particle.FLAME, maxX, y, minZ, 3, 0, 0.3, 0, 0);
-                player.spawnParticle(Particle.FLAME, minX, y, maxZ, 3, 0, 0.3, 0, 0);
-                player.spawnParticle(Particle.FLAME, maxX, y, maxZ, 3, 0, 0.3, 0, 0);
-
-                for (int x = minX; x <= maxX; x += 2) {
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, x, y, minZ, 1, 0, 0, 0, 0);
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, x, y, maxZ, 1, 0, 0, 0, 0);
+                for (int x = minX; x <= maxX; x++) {
+                    player.spawnParticle(Particle.HAPPY_VILLAGER, x, particleY, minZ, 1, 0, 0, 0, 0);
+                    player.spawnParticle(Particle.HAPPY_VILLAGER, x, particleY, maxZ, 1, 0, 0, 0, 0);
                 }
-                for (int z = minZ; z <= maxZ; z += 2) {
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, minX, y, z, 1, 0, 0, 0, 0);
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, maxX, y, z, 1, 0, 0, 0, 0);
+                for (int z = minZ; z <= maxZ; z++) {
+                    player.spawnParticle(Particle.HAPPY_VILLAGER, minX, particleY, z, 1, 0, 0, 0, 0);
+                    player.spawnParticle(Particle.HAPPY_VILLAGER, maxX, particleY, z, 1, 0, 0, 0, 0);
                 }
                 count++;
             }
         }, 0L, 15L);
     }
 
-    // --- GOLDEN SHOVEL CLAIMING ---
     @EventHandler
-    public void onShovelClick(PlayerInteractEvent event) {
+    public void onToolInteract(PlayerInteractEvent event) {
         if (event.getHand() != EquipmentSlot.HAND) return;
-        Player player = event.getPlayer();
-        if (event.getItem() == null || event.getItem().getType() != Material.GOLDEN_SHOVEL) return;
         if (event.getClickedBlock() == null || event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
 
-        event.setCancelled(true);
+        Player player = event.getPlayer();
+        Material item = (event.getItem() != null) ? event.getItem().getType() : Material.AIR;
         Location clicked = event.getClickedBlock().getLocation();
         UUID uuid = player.getUniqueId();
 
-        if (player.isSneaking()) {
-            Claim inside = getClaimAt(clicked);
-            if (inside != null && (inside.owner.equals(uuid) || player.isOp())) {
-                openControlPanelGUI(player, inside);
-                return;
+        if (item == Material.STICK) {
+            event.setCancelled(true);
+            Claim found = getClaimAt(clicked);
+            if (found == null) {
+                player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_BASS, 0.8f, 1.0f);
+                player.sendMessage(ChatColor.GREEN + "This area is UNCLAIMED (Wilderness).");
+            } else {
+                player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 0.9f, 1.5f);
+                showClaimVisuals(player, found);
+                player.sendMessage(ChatColor.GOLD + "====================================");
+                player.sendMessage(ChatColor.RED + "" + ChatColor.BOLD + "ALREADY CLAIMED! " + ChatColor.YELLOW + "Owner: " + ChatColor.WHITE + found.ownerName);
+                player.sendMessage(ChatColor.YELLOW + "Claim Name: " + ChatColor.AQUA + found.title + ChatColor.GRAY + " (#" + found.number + ")");
+                player.sendMessage(ChatColor.YELLOW + "Size: " + ChatColor.WHITE + found.getWidth() + "x" + found.getLength() + " (" + found.getArea() + " blocks)");
+                player.sendMessage(ChatColor.YELLOW + "Trusted Players: " + ChatColor.WHITE + found.trusted.size());
+                player.sendMessage(ChatColor.GOLD + "====================================");
             }
+            return;
         }
 
-        if (!corner1Map.containsKey(uuid)) {
-            corner1Map.put(uuid, clicked);
-            player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 1.0f, 1.5f);
-            player.spawnParticle(Particle.FLAME, clicked.clone().add(0.5, 1.2, 0.5), 10, 0.1, 0.3, 0.1, 0);
-            player.sendMessage(ChatColor.YELLOW + "Corner 1 set at (" + clicked.getBlockX() + ", " + clicked.getBlockZ() + ")! Available Blocks: " + ChatColor.GOLD + getAvailableBlocks(uuid) + ChatColor.YELLOW + ". Right-click Corner 2.");
-        } else {
-            Location pos1 = corner1Map.remove(uuid);
-            if (!pos1.getWorld().equals(clicked.getWorld())) {
-                player.sendMessage(ChatColor.RED + "Both corners must be in the same world!");
-                return;
+        if (item == Material.GOLDEN_SHOVEL) {
+            event.setCancelled(true);
+
+            if (player.isSneaking()) {
+                Claim inside = getClaimAt(clicked);
+                if (inside != null && (inside.owner.equals(uuid) || player.isOp())) {
+                    openClaimSettingsGUI(player, inside);
+                    return;
+                }
             }
-            createClaim(player, pos1, clicked);
+
+            if (!corner1Map.containsKey(uuid)) {
+                corner1Map.put(uuid, clicked);
+                player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 1.0f, 1.5f);
+                player.sendBlockChange(clicked, Material.GOLD_BLOCK.createBlockData());
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    if (player.isOnline()) player.sendBlockChange(clicked, clicked.getBlock().getBlockData());
+                }, 200L);
+                player.sendMessage(ChatColor.YELLOW + "Corner 1 set at (" + clicked.getBlockX() + ", " + clicked.getBlockZ() + ")! Right-click Corner 2.");
+            } else {
+                Location pos1 = corner1Map.remove(uuid);
+                if (!pos1.getWorld().equals(clicked.getWorld())) {
+                    player.sendMessage(ChatColor.RED + "Both corners must be in the same world!");
+                    return;
+                }
+                createClaim(player, pos1, clicked);
+            }
         }
     }
 
-    // --- COMMANDS (/claim & /claimsettings) ---
+    private Claim findClaimByIdentifier(List<Claim> myClaims, String rawInput) {
+        if (rawInput == null || rawInput.isEmpty()) return null;
+        String clean = rawInput.replaceFirst("^#", "").trim();
+
+        try {
+            int num = Integer.parseInt(clean);
+            for (Claim c : myClaims) {
+                if (c.number == num) return c;
+            }
+            if (num >= 1 && num <= myClaims.size()) {
+                return myClaims.get(num - 1);
+            }
+        } catch (NumberFormatException ignored) {}
+
+        for (Claim c : myClaims) {
+            if (c.title.equalsIgnoreCase(rawInput)) {
+                return c;
+            }
+        }
+
+        String lower = rawInput.toLowerCase();
+        for (Claim c : myClaims) {
+            if (c.title.toLowerCase().contains(lower)) {
+                return c;
+            }
+        }
+
+        return null;
+    }
+
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (!(sender instanceof Player)) {
-            sender.sendMessage("Only players can run this command.");
+            sender.sendMessage("Only players can use this command.");
             return true;
         }
+        if (!command.getName().equalsIgnoreCase("claim")) return false;
+
         Player player = (Player) sender;
         UUID uuid = player.getUniqueId();
 
-        if (command.getName().equalsIgnoreCase("claimsettings")) {
-            Claim claim = getClaimAt(player.getLocation());
-            if (claim == null) {
-                player.sendMessage(ChatColor.RED + "Stand inside your claim to open settings!");
-                return true;
-            }
-            if (!claim.owner.equals(uuid) && !player.isOp()) {
-                player.sendMessage(ChatColor.RED + "You do not own this claim!");
-                return true;
-            }
-            openControlPanelGUI(player, claim);
+        // /claim -> Claim 10x10 = 100 blocks area (claim-1, claim-2...)
+        if (args.length == 0) {
+            Location center = player.getLocation();
+            createClaim(player, center.clone().add(-4, 0, -4), center.clone().add(5, 0, 5));
             return true;
         }
 
-        if (command.getName().equalsIgnoreCase("claim")) {
-            // /claim -> Claims a 10x10 = 100 blocks area around the player!
-            if (args.length == 0) {
-                Location center = player.getLocation();
-                Location pos1 = center.clone().add(-4, 0, -4);
-                Location pos2 = center.clone().add(5, 0, 5);
-                createClaim(player, pos1, pos2);
+        String sub = args[0].toLowerCase();
+
+        if (sub.equals("tp")) {
+            List<Claim> myClaims = getPlayerClaims(uuid);
+            if (myClaims.isEmpty()) {
+                player.sendMessage(ChatColor.RED + "You don't have any claims yet! Type /claim to create claim-1.");
                 return true;
             }
 
-            String sub = args[0].toLowerCase();
-
-            // /claim 100 -> Also claims 10x10 = 100 blocks area
-            if (sub.equals("100")) {
-                Location center = player.getLocation();
-                Location pos1 = center.clone().add(-4, 0, -4);
-                Location pos2 = center.clone().add(5, 0, 5);
-                createClaim(player, pos1, pos2);
+            if (args.length == 1) {
+                openClaimTPGUI(player);
                 return true;
             }
 
-            // /claim chunk -> Claims current 16x16 chunk (256 blocks)
-            if (sub.equals("chunk")) {
-                Chunk ch = player.getLocation().getChunk();
-                Location pos1 = new Location(ch.getWorld(), ch.getX() * 16, 64, ch.getZ() * 16);
-                Location pos2 = new Location(ch.getWorld(), ch.getX() * 16 + 15, 64, ch.getZ() * 16 + 15);
-                createClaim(player, pos1, pos2);
+            String query = String.join(" ", Arrays.copyOfRange(args, 1, args.length)).trim();
+            Claim target = findClaimByIdentifier(myClaims, query);
+            if (target != null) {
+                teleportToClaim(player, target);
+            } else {
+                player.sendMessage(ChatColor.RED + "Claim '" + query + "' not found! Use /claim list or /claim tp.");
+            }
+            return true;
+        }
+
+        if (sub.equals("sethome")) {
+            List<Claim> myClaims = getPlayerClaims(uuid);
+            Claim target = null;
+
+            if (args.length >= 2) {
+                String query = String.join(" ", Arrays.copyOfRange(args, 1, args.length)).trim();
+                target = findClaimByIdentifier(myClaims, query);
+            }
+
+            if (target == null) {
+                Claim standing = getClaimAt(player.getLocation());
+                if (standing != null && (standing.owner.equals(uuid) || player.isOp())) {
+                    target = standing;
+                }
+            }
+
+            if (target == null) {
+                player.sendMessage(ChatColor.RED + "Stand inside your claim or use: /claim sethome <number|claim-1>");
                 return true;
             }
 
-            // /claim blocks -> View Claim Blocks balance
-            if (sub.equals("blocks") || sub.equals("balance")) {
+            target.home = player.getLocation();
+            saveData();
+            player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.2f);
+            player.sendMessage(ChatColor.GREEN + "Claim home set for " + ChatColor.GOLD + target.title + ChatColor.GREEN + "!");
+            return true;
+        }
+
+        if (sub.equals("list")) {
+            List<Claim> myClaims = getPlayerClaims(uuid);
+            player.sendMessage(ChatColor.GOLD + "=== Your Claims (" + myClaims.size() + " | Available: " + getAvailableBlocks(uuid) + " blocks) ===");
+            if (myClaims.isEmpty()) {
+                player.sendMessage(ChatColor.GRAY + "No claims yet. Type /claim to create claim-1.");
+            } else {
+                for (Claim c : myClaims) {
+                    player.sendMessage(ChatColor.GOLD + "#" + c.number + " " + ChatColor.AQUA + c.title
+                            + ChatColor.GRAY + " [" + c.getWidth() + "x" + c.getLength() + " = " + c.getArea() + " blocks]"
+                            + ChatColor.YELLOW + " (X:" + c.minX + ", Z:" + c.minZ + ")");
+                }
+            }
+            return true;
+        }
+
+        if (sub.equals("rename")) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.YELLOW + "Usage: /claim rename <name> OR /claim rename <number|claim-1> <name>");
+                return true;
+            }
+
+            List<Claim> myClaims = getPlayerClaims(uuid);
+            Claim targetClaim = null;
+            String newName = "";
+
+            if (args.length >= 3) {
+                Claim byId = findClaimByIdentifier(myClaims, args[1]);
+                if (byId != null) {
+                    targetClaim = byId;
+                    newName = String.join(" ", Arrays.copyOfRange(args, 2, args.length)).trim();
+                }
+            }
+
+            if (targetClaim == null) {
+                Claim standing = getClaimAt(player.getLocation());
+                if (standing != null && (standing.owner.equals(uuid) || player.isOp())) {
+                    targetClaim = standing;
+                    newName = String.join(" ", Arrays.copyOfRange(args, 1, args.length)).trim();
+                } else {
+                    player.sendMessage(ChatColor.RED + "Stand inside your claim or use: /claim rename <number|claim-1> <name>");
+                    return true;
+                }
+            }
+
+            if (newName.isEmpty()) {
+                player.sendMessage(ChatColor.RED + "Please enter a new claim name!");
+                return true;
+            }
+
+            targetClaim.title = newName;
+            saveData();
+            handleZoneEntry(player, player.getLocation(), true);
+            player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.3f);
+            player.sendMessage(ChatColor.GREEN + "Renamed #" + targetClaim.number + " to: " + ChatColor.GOLD + targetClaim.title);
+            return true;
+        }
+
+        if (sub.equals("blocks")) {
+            int avail = getAvailableBlocks(uuid);
+            int used = getUsedBlocks(uuid);
+            player.sendMessage(ChatColor.GOLD + "=== Claim Blocks ===");
+            player.sendMessage(ChatColor.GREEN + "Available: " + ChatColor.GOLD + avail);
+            player.sendMessage(ChatColor.YELLOW + "Used: " + ChatColor.WHITE + used);
+            player.sendMessage(ChatColor.AQUA + "Total: " + ChatColor.WHITE + (avail + used));
+            return true;
+        }
+
+        if (sub.equals("info")) {
+            Claim c = getClaimAt(player.getLocation());
+            if (c == null) {
+                player.sendMessage(ChatColor.GREEN + "Unclaimed Wilderness. Type " + ChatColor.YELLOW + "/claim" + ChatColor.GREEN + " to claim 100 blocks.");
+                return true;
+            }
+            showClaimVisuals(player, c);
+            player.sendMessage(ChatColor.GOLD + "=== Claim Info ===");
+            player.sendMessage(ChatColor.YELLOW + "Owner: " + ChatColor.WHITE + c.ownerName);
+            player.sendMessage(ChatColor.YELLOW + "Claim: " + ChatColor.AQUA + c.title + ChatColor.GRAY + " (#" + c.number + ")");
+            player.sendMessage(ChatColor.YELLOW + "Size: " + ChatColor.WHITE + c.getWidth() + "x" + c.getLength() + " (" + c.getArea() + " blocks)");
+            player.sendMessage(ChatColor.YELLOW + "Trusted: " + ChatColor.WHITE + c.trusted.size());
+            return true;
+        }
+
+        if (sub.equals("unclaimall")) {
+            int refunded = 0;
+            int count = 0;
+            Iterator<Claim> it = claims.iterator();
+            while (it.hasNext()) {
+                Claim c = it.next();
+                if (c.owner.equals(uuid)) {
+                    refunded += c.getArea();
+                    count++;
+                    it.remove();
+                }
+            }
+            if (count > 0) {
+                addBlocks(uuid, refunded);
+                handleZoneEntry(player, player.getLocation(), false);
+                player.sendMessage(ChatColor.YELLOW + "Unclaimed " + count + " claims and refunded " + ChatColor.GOLD + refunded + " Claim Blocks" + ChatColor.YELLOW + ".");
+            } else {
+                player.sendMessage(ChatColor.RED + "You have no claims!");
+            }
+            return true;
+        }
+
+        Claim claim = getClaimAt(player.getLocation());
+        if (claim == null || (!claim.owner.equals(uuid) && !player.isOp())) {
+            if (sub.equals("help")) sendHelp(player);
+            else player.sendMessage(ChatColor.RED + "Stand inside your own claim to use this command!");
+            return true;
+        }
+
+        if (sub.equals("setting")) {
+            openClaimSettingsGUI(player, claim);
+            return true;
+        }
+
+        if (sub.equals("border")) {
+            showClaimVisuals(player, claim);
+            player.sendMessage(ChatColor.AQUA + "Showing claim border and corner markers.");
+            return true;
+        }
+
+        if (sub.equals("unclaim")) {
+            int refunded = claim.getArea();
+            claims.remove(claim);
+            addBlocks(claim.owner, refunded);
+            handleZoneEntry(player, player.getLocation(), false);
+            player.sendMessage(ChatColor.YELLOW + "Removed " + ChatColor.GOLD + claim.title + ChatColor.YELLOW + "! Refunded " + ChatColor.GOLD + refunded + " Claim Blocks" + ChatColor.YELLOW + ".");
+            return true;
+        }
+
+        if (sub.equals("expand")) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.YELLOW + "Usage: /claim expand <blocks>");
+                return true;
+            }
+            try {
+                int amount = Integer.parseInt(args[1]);
+                if (amount <= 0) {
+                    player.sendMessage(ChatColor.RED + "Enter a positive number!");
+                    return true;
+                }
+                Claim expanded = new Claim(claim.id, claim.owner, claim.ownerName, claim.world,
+                        claim.minX - amount, claim.maxX + amount, claim.minZ - amount, claim.maxZ + amount);
+                int extraBlocks = expanded.getArea() - claim.getArea();
                 int avail = getAvailableBlocks(uuid);
-                int used = getUsedBlocks(uuid);
-                player.sendMessage(ChatColor.GOLD + "=== Your Claim Blocks ===");
-                player.sendMessage(ChatColor.GREEN + "Available Blocks: " + ChatColor.GOLD + avail);
-                player.sendMessage(ChatColor.YELLOW + "Used in Claims: " + ChatColor.WHITE + used);
-                player.sendMessage(ChatColor.AQUA + "Total Earned: " + ChatColor.WHITE + (avail + used));
-                return true;
-            }
 
-            // /claim giveblocks <player> <amount> (Admin)
-            if (sub.equals("giveblocks")) {
-                if (!player.isOp()) {
-                    player.sendMessage(ChatColor.RED + "You don't have permission!");
+                if (avail < extraBlocks) {
+                    player.sendMessage(ChatColor.RED + "Not enough Claim Blocks! Needed: " + extraBlocks + " | Available: " + avail);
                     return true;
                 }
-                if (args.length < 3) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim giveblocks <player> <amount>");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target == null) {
-                    player.sendMessage(ChatColor.RED + "Player is offline!");
-                    return true;
-                }
-                try {
-                    int amt = Integer.parseInt(args[2]);
-                    addBlocks(target.getUniqueId(), amt);
-                    player.sendMessage(ChatColor.GREEN + "Gave " + ChatColor.GOLD + amt + " Claim Blocks" + ChatColor.GREEN + " to " + target.getName() + "!");
-                    target.sendMessage(ChatColor.GREEN + "You received " + ChatColor.GOLD + amt + " Claim Blocks" + ChatColor.GREEN + "!");
-                } catch (NumberFormatException e) {
-                    player.sendMessage(ChatColor.RED + "Please enter a valid number!");
-                }
-                return true;
-            }
-
-            // /claim home -> Teleport to your claim
-            if (sub.equals("home") || sub.equals("tp")) {
-                for (Claim c : claims) {
-                    if (c.owner.equals(uuid) && c.home != null) {
-                        player.teleport(c.home);
-                        player.sendMessage(ChatColor.GREEN + "Teleported to your claim home!");
+                for (Claim other : claims) {
+                    if (!other.id.equals(claim.id) && other.overlaps(expanded)) {
+                        player.sendMessage(ChatColor.RED + "Cannot expand: overlaps another claim!");
                         return true;
                     }
                 }
-                player.sendMessage(ChatColor.RED + "You do not have a claim yet! Type /claim first.");
-                return true;
-            }
 
-            // /claim list -> List all your claims
-            if (sub.equals("list")) {
-                player.sendMessage(ChatColor.GOLD + "=== Your Claims (Available Blocks: " + getAvailableBlocks(uuid) + ") ===");
-                int idx = 1;
-                for (Claim c : claims) {
-                    if (c.owner.equals(uuid)) {
-                        player.sendMessage(ChatColor.YELLOW + "#" + idx + " " + ChatColor.WHITE + c.title + ChatColor.GRAY + " [" + c.getWidth() + "x" + c.getLength() + " = " + c.getArea() + " blocks] at X:" + c.minX + ", Z:" + c.minZ);
-                        idx++;
-                    }
-                }
-                if (idx == 1) player.sendMessage(ChatColor.GRAY + "You have no claims.");
-                return true;
-            }
-
-            // /claim info -> Info about claim you stand in
-            if (sub.equals("info")) {
-                Claim c = getClaimAt(player.getLocation());
-                if (c == null) {
-                    player.sendMessage(ChatColor.GREEN + "Unclaimed Wilderness. Type " + ChatColor.YELLOW + "/claim" + ChatColor.GREEN + " to claim 100 blocks (10x10)!");
-                    return true;
-                }
-                player.sendMessage(ChatColor.GOLD + "=== Claim Information ===");
-                player.sendMessage(ChatColor.YELLOW + "Owner: " + ChatColor.WHITE + c.ownerName);
-                player.sendMessage(ChatColor.YELLOW + "Title: " + ChatColor.WHITE + c.title);
-                player.sendMessage(ChatColor.YELLOW + "Size: " + ChatColor.WHITE + c.getWidth() + "x" + c.getLength() + " (" + c.getArea() + " blocks)");
-                player.sendMessage(ChatColor.YELLOW + "Trusted Players: " + ChatColor.WHITE + c.trusted.size());
-                return true;
-            }
-
-            // /claim unclaimall
-            if (sub.equals("unclaimall")) {
-                int refunded = 0;
-                int count = 0;
-                Iterator<Claim> it = claims.iterator();
-                while (it.hasNext()) {
-                    Claim c = it.next();
-                    if (c.owner.equals(uuid)) {
-                        refunded += c.getArea();
-                        count++;
-                        it.remove();
-                    }
-                }
-                if (count > 0) {
-                    addBlocks(uuid, refunded);
-                    updateBossBar(player, player.getLocation());
-                    player.sendMessage(ChatColor.YELLOW + "Removed " + count + " claims and refunded " + ChatColor.GOLD + refunded + " Claim Blocks" + ChatColor.YELLOW + "!");
-                } else {
-                    player.sendMessage(ChatColor.RED + "You don't have any claims!");
-                }
-                return true;
-            }
-
-            // Commands that require standing inside your claim
-            Claim claim = getClaimAt(player.getLocation());
-            if (claim == null || (!claim.owner.equals(uuid) && !player.isOp())) {
-                if (sub.equals("help")) {
-                    sendHelp(player);
-                } else {
-                    player.sendMessage(ChatColor.RED + "Stand inside your own claim to use this command! (Type /claim help for all commands)");
-                }
-                return true;
-            }
-
-            if (sub.equals("gui") || sub.equals("settings") || sub.equals("menu")) {
-                openControlPanelGUI(player, claim);
-                return true;
-            }
-
-            if (sub.equals("border") || sub.equals("view")) {
-                showClaimBorder(player, claim);
-                player.sendMessage(ChatColor.AQUA + "Showing glowing claim borders!");
-                return true;
-            }
-
-            if (sub.equals("sethome")) {
-                claim.home = player.getLocation();
+                claim.minX = expanded.minX;
+                claim.maxX = expanded.maxX;
+                claim.minZ = expanded.minZ;
+                claim.maxZ = expanded.maxZ;
+                setAvailableBlocks(uuid, avail - extraBlocks);
                 saveData();
-                player.sendMessage(ChatColor.GREEN + "Claim home updated to your current position!");
-                return true;
+                showClaimVisuals(player, claim);
+                player.sendMessage(ChatColor.GREEN + "Expanded " + ChatColor.GOLD + claim.title + ChatColor.GREEN + "! Used " + ChatColor.GOLD + extraBlocks + " blocks" + ChatColor.GREEN + ".");
+            } catch (NumberFormatException e) {
+                player.sendMessage(ChatColor.RED + "Invalid number!");
             }
-
-            if (sub.equals("unclaim")) {
-                int refunded = claim.getArea();
-                claims.remove(claim);
-                addBlocks(claim.owner, refunded);
-                updateBossBar(player, player.getLocation());
-                player.sendMessage(ChatColor.YELLOW + "Claim removed! Refunded " + ChatColor.GOLD + refunded + " Claim Blocks" + ChatColor.YELLOW + ".");
-                return true;
-            }
-
-            // /claim expand <blocks>
-            if (sub.equals("expand")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim expand <blocks>");
-                    return true;
-                }
-                try {
-                    int amount = Integer.parseInt(args[1]);
-                    if (amount <= 0) {
-                        player.sendMessage(ChatColor.RED + "Enter a positive number!");
-                        return true;
-                    }
-                    Claim expanded = new Claim(claim.id, claim.owner, claim.ownerName, claim.world,
-                            claim.minX - amount, claim.maxX + amount, claim.minZ - amount, claim.maxZ + amount);
-                    int extraBlocks = expanded.getArea() - claim.getArea();
-                    int avail = getAvailableBlocks(uuid);
-
-                    if (avail < extraBlocks) {
-                        player.sendMessage(ChatColor.RED + "Not enough Claim Blocks to expand! Needed: " + extraBlocks + " | Available: " + avail);
-                        return true;
-                    }
-                    for (Claim other : claims) {
-                        if (!other.id.equals(claim.id) && other.overlaps(expanded)) {
-                            player.sendMessage(ChatColor.RED + "Cannot expand: overlaps with another claim!");
-                            return true;
-                        }
-                    }
-
-                    claim.minX = expanded.minX;
-                    claim.maxX = expanded.maxX;
-                    claim.minZ = expanded.minZ;
-                    claim.maxZ = expanded.maxZ;
-                    setAvailableBlocks(uuid, avail - extraBlocks);
-                    saveData();
-                    showClaimBorder(player, claim);
-                    player.sendMessage(ChatColor.GREEN + "Claim expanded! Used " + ChatColor.GOLD + extraBlocks + " blocks" + ChatColor.GREEN + ". New size: " + claim.getWidth() + "x" + claim.getLength());
-                } catch (NumberFormatException e) {
-                    player.sendMessage(ChatColor.RED + "Invalid number!");
-                }
-                return true;
-            }
-
-            if (sub.equals("trust") || sub.equals("add")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim trust <player>");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target == null) {
-                    player.sendMessage(ChatColor.RED + "Player is offline!");
-                    return true;
-                }
-                claim.trusted.add(target.getUniqueId());
-                claim.banned.remove(target.getUniqueId());
-                saveData();
-                player.sendMessage(ChatColor.GREEN + "Trusted " + ChatColor.GOLD + target.getName() + ChatColor.GREEN + " in this claim!");
-                target.sendMessage(ChatColor.GREEN + "You have been trusted in " + ChatColor.GOLD + player.getName() + "'s" + ChatColor.GREEN + " claim!");
-                return true;
-            }
-
-            if (sub.equals("untrust") || sub.equals("remove")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim untrust <player>");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target != null && claim.trusted.remove(target.getUniqueId())) {
-                    saveData();
-                    player.sendMessage(ChatColor.YELLOW + "Removed " + target.getName() + " from trusted players.");
-                } else {
-                    player.sendMessage(ChatColor.RED + "Player is not trusted in this claim!");
-                }
-                return true;
-            }
-
-            if (sub.equals("ban")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim ban <player>");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target == null || target.equals(player)) {
-                    player.sendMessage(ChatColor.RED + "Invalid player!");
-                    return true;
-                }
-                claim.banned.add(target.getUniqueId());
-                claim.trusted.remove(target.getUniqueId());
-                saveData();
-                player.sendMessage(ChatColor.RED + "Banned " + ChatColor.GOLD + target.getName() + ChatColor.RED + " from this claim!");
-                if (claim.contains(target.getLocation())) {
-                    target.teleport(target.getWorld().getSpawnLocation());
-                    target.sendMessage(ChatColor.RED + "You were banned from " + claim.ownerName + "'s claim!");
-                }
-                return true;
-            }
-
-            if (sub.equals("unban")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim unban <player>");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target != null && claim.banned.remove(target.getUniqueId())) {
-                    saveData();
-                    player.sendMessage(ChatColor.GREEN + "Unbanned " + target.getName() + " from this claim.");
-                } else {
-                    player.sendMessage(ChatColor.RED + "Player is not banned!");
-                }
-                return true;
-            }
-
-            if (sub.equals("kick")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim kick <player>");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target != null && claim.contains(target.getLocation()) && !target.equals(player)) {
-                    target.teleport(target.getWorld().getSpawnLocation());
-                    target.sendMessage(ChatColor.RED + "You were kicked from " + claim.ownerName + "'s claim!");
-                    player.sendMessage(ChatColor.YELLOW + "Kicked " + target.getName() + " from your claim.");
-                } else {
-                    player.sendMessage(ChatColor.RED + "That player is not inside your claim!");
-                }
-                return true;
-            }
-
-            if (sub.equals("rename")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim rename <New Title>");
-                    return true;
-                }
-                StringBuilder sb = new StringBuilder();
-                for (int i = 1; i < args.length; i++) sb.append(args[i]).append(" ");
-                claim.title = sb.toString().trim();
-                saveData();
-                updateBossBar(player, player.getLocation());
-                player.sendMessage(ChatColor.GREEN + "Claim BossBar title changed to: " + ChatColor.YELLOW + claim.title);
-                return true;
-            }
-
-            if (sub.equals("transfer")) {
-                if (args.length < 2) {
-                    player.sendMessage(ChatColor.YELLOW + "Usage: /claim transfer <player>");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target == null) {
-                    player.sendMessage(ChatColor.RED + "Player is offline!");
-                    return true;
-                }
-                claim.owner = target.getUniqueId();
-                claim.ownerName = target.getName();
-                claim.title = target.getName() + "'s Claim";
-                saveData();
-                updateBossBar(player, player.getLocation());
-                player.sendMessage(ChatColor.GREEN + "Transferred claim ownership to " + ChatColor.GOLD + target.getName() + ChatColor.GREEN + "!");
-                return true;
-            }
-
-            sendHelp(player);
             return true;
         }
-        return false;
+
+        if (sub.equals("trust")) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.YELLOW + "Usage: /claim trust <player>");
+                return true;
+            }
+            Player target = Bukkit.getPlayer(args[1]);
+            if (target == null) {
+                player.sendMessage(ChatColor.RED + "Player is offline!");
+                return true;
+            }
+            claim.trusted.add(target.getUniqueId());
+            claim.banned.remove(target.getUniqueId());
+            saveData();
+            player.sendMessage(ChatColor.GREEN + "Trusted " + ChatColor.GOLD + target.getName() + ChatColor.GREEN + " in " + claim.title + "!");
+            target.sendMessage(ChatColor.GREEN + "You are now trusted in " + ChatColor.GOLD + claim.title + ChatColor.GREEN + "!");
+            return true;
+        }
+
+        if (sub.equals("untrust")) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.YELLOW + "Usage: /claim untrust <player>");
+                return true;
+            }
+            Player target = Bukkit.getPlayer(args[1]);
+            if (target != null && claim.trusted.remove(target.getUniqueId())) {
+                saveData();
+                player.sendMessage(ChatColor.YELLOW + "Removed " + target.getName() + " from trusted players.");
+            } else {
+                player.sendMessage(ChatColor.RED + "Player is not trusted!");
+            }
+            return true;
+        }
+
+        if (sub.equals("ban")) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.YELLOW + "Usage: /claim ban <player>");
+                return true;
+            }
+            Player target = Bukkit.getPlayer(args[1]);
+            if (target == null || target.equals(player)) {
+                player.sendMessage(ChatColor.RED + "Invalid player!");
+                return true;
+            }
+            claim.banned.add(target.getUniqueId());
+            claim.trusted.remove(target.getUniqueId());
+            saveData();
+            player.sendMessage(ChatColor.RED + "Banned " + ChatColor.GOLD + target.getName() + ChatColor.RED + " from " + claim.title + "!");
+            if (claim.contains(target.getLocation())) {
+                target.teleport(target.getWorld().getSpawnLocation());
+                target.sendMessage(ChatColor.RED + "You were banned from " + claim.title + "!");
+            }
+            return true;
+        }
+
+        if (sub.equals("unban")) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.YELLOW + "Usage: /claim unban <player>");
+                return true;
+            }
+            Player target = Bukkit.getPlayer(args[1]);
+            if (target != null && claim.banned.remove(target.getUniqueId())) {
+                saveData();
+                player.sendMessage(ChatColor.GREEN + "Unbanned " + target.getName() + ".");
+            } else {
+                player.sendMessage(ChatColor.RED + "Player is not banned!");
+            }
+            return true;
+        }
+
+        if (sub.equals("kick")) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.YELLOW + "Usage: /claim kick <player>");
+                return true;
+            }
+            Player target = Bukkit.getPlayer(args[1]);
+            if (target != null && claim.contains(target.getLocation()) && !target.equals(player)) {
+                target.teleport(target.getWorld().getSpawnLocation());
+                target.sendMessage(ChatColor.RED + "You were kicked from " + claim.title + "!");
+                player.sendMessage(ChatColor.YELLOW + "Kicked " + target.getName() + ".");
+            } else {
+                player.sendMessage(ChatColor.RED + "Player is not inside your claim!");
+            }
+            return true;
+        }
+
+        sendHelp(player);
+        return true;
+    }
+
+    private void teleportToClaim(Player player, Claim claim) {
+        Location dest = claim.home;
+        if (dest == null) {
+            World w = Bukkit.getWorld(claim.world);
+            if (w == null) return;
+            int cx = (claim.minX + claim.maxX) / 2;
+            int cz = (claim.minZ + claim.maxZ) / 2;
+            int cy = w.getHighestBlockYAt(cx, cz) + 1;
+            dest = new Location(w, cx + 0.5, cy, cz + 0.5);
+        }
+        player.teleport(dest);
+        player.playSound(player.getLocation(), Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.2f);
+        player.sendMessage(ChatColor.GREEN + "Teleported to " + ChatColor.GOLD + claim.title + ChatColor.GRAY + " (#" + claim.number + ")");
     }
 
     private void sendHelp(Player player) {
-        player.sendMessage(ChatColor.GOLD + "=== AdvancedLandClaim Commands ===");
-        player.sendMessage(ChatColor.YELLOW + "/claim" + ChatColor.GRAY + " - Claim a 10x10 area (100 Claim Blocks)");
-        player.sendMessage(ChatColor.YELLOW + "/claim chunk" + ChatColor.GRAY + " - Claim a 16x16 chunk (256 Claim Blocks)");
-        player.sendMessage(ChatColor.YELLOW + "/claim gui" + ChatColor.GRAY + " - Open 45-slot Claim Control Panel GUI");
-        player.sendMessage(ChatColor.YELLOW + "/claim blocks" + ChatColor.GRAY + " - Check your Claim Blocks balance");
-        player.sendMessage(ChatColor.YELLOW + "/claim expand <blocks>" + ChatColor.GRAY + " - Expand claim in all directions");
-        player.sendMessage(ChatColor.YELLOW + "/claim trust | untrust <player>" + ChatColor.GRAY + " - Manage friends");
+        player.sendMessage(ChatColor.GOLD + "=== Claim Commands ===");
+        player.sendMessage(ChatColor.YELLOW + "/claim" + ChatColor.GRAY + " - Claim 10x10 area (claim-1, claim-2...)");
+        player.sendMessage(ChatColor.YELLOW + "/claim setting" + ChatColor.GRAY + " - Open Claim Settings menu");
+        player.sendMessage(ChatColor.YELLOW + "/claim tp [number|claim-1|name]" + ChatColor.GRAY + " - Teleport to a claim");
+        player.sendMessage(ChatColor.YELLOW + "/claim sethome [number|claim-1]" + ChatColor.GRAY + " - Set claim teleport point");
+        player.sendMessage(ChatColor.YELLOW + "/claim rename [number|claim-1] <name>" + ChatColor.GRAY + " - Rename a claim");
+        player.sendMessage(ChatColor.YELLOW + "/claim trust | untrust <player>" + ChatColor.GRAY + " - Trust or untrust a player");
         player.sendMessage(ChatColor.YELLOW + "/claim ban | unban | kick <player>" + ChatColor.GRAY + " - Manage visitors");
-        player.sendMessage(ChatColor.YELLOW + "/claim home | sethome" + ChatColor.GRAY + " - Teleport or set claim home");
-        player.sendMessage(ChatColor.YELLOW + "/claim border" + ChatColor.GRAY + " - Show glowing claim border");
-        player.sendMessage(ChatColor.YELLOW + "/claim rename <title>" + ChatColor.GRAY + " - Customize BossBar title");
-        player.sendMessage(ChatColor.YELLOW + "/claim unclaim | unclaimall" + ChatColor.GRAY + " - Unclaim & refund blocks");
-        player.sendMessage(ChatColor.YELLOW + "/claim info | list" + ChatColor.GRAY + " - View claim info & your list");
+        player.sendMessage(ChatColor.YELLOW + "/claim list | border | blocks" + ChatColor.GRAY + " - View & manage claims");
+        player.sendMessage(ChatColor.YELLOW + "/claim expand <blocks> | unclaim" + ChatColor.GRAY + " - Expand or unclaim land");
     }
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        List<String> allSubs = Arrays.asList(
+                "setting", "tp", "sethome", "trust", "untrust", "ban", "unban",
+                "kick", "list", "rename", "border", "blocks", "expand",
+                "unclaim", "unclaimall", "info", "help"
+        );
         if (args.length == 1) {
-            return Arrays.asList("100", "chunk", "gui", "blocks", "expand", "trust", "untrust", "ban", "unban", "kick", "home", "sethome", "border", "rename", "transfer", "unclaim", "unclaimall", "info", "list", "giveblocks", "help");
+            String prefix = args[0].toLowerCase();
+            List<String> matches = new ArrayList<>();
+            for (String s : allSubs) {
+                if (s.startsWith(prefix)) matches.add(s);
+            }
+            return matches;
         }
-        return null;
+        if (args.length == 2 && (args[0].equalsIgnoreCase("tp") || args[0].equalsIgnoreCase("sethome") || args[0].equalsIgnoreCase("rename")) && sender instanceof Player) {
+            List<Claim> myClaims = getPlayerClaims(((Player) sender).getUniqueId());
+            List<String> suggestions = new ArrayList<>();
+            for (Claim c : myClaims) {
+                suggestions.add(String.valueOf(c.number));
+                suggestions.add(c.title);
+            }
+            return suggestions;
+        }
+        return Collections.emptyList();
     }
 
-    // --- 45-SLOT SIMPLECLAIMSYSTEM-STYLE GUI CONTROL PANEL ---
-    private void openControlPanelGUI(Player player, Claim claim) {
+    // --- PREMIUM SIMPLECLAIMSYSTEM-STYLE "Claim Settings" GUI ---
+    private void openClaimSettingsGUI(Player player, Claim claim) {
         editingClaim.put(player.getUniqueId(), claim);
-        Inventory gui = Bukkit.createInventory(null, 45, ChatColor.DARK_GRAY + "Claim Control Panel");
+        Inventory gui = Bukkit.createInventory(null, 36, GUI_TITLE);
 
-        ItemStack borderGlass = new ItemStack(Material.BLACK_STAINED_GLASS_PANE);
-        ItemMeta bMeta = borderGlass.getItemMeta();
-        if (bMeta != null) {
-            bMeta.setDisplayName(" ");
-            borderGlass.setItemMeta(bMeta);
+        ItemStack pane = new ItemStack(Material.CYAN_STAINED_GLASS_PANE);
+        ItemMeta pm = pane.getItemMeta();
+        if (pm != null) {
+            pm.setDisplayName(" ");
+            pane.setItemMeta(pm);
         }
-        for (int i = 0; i < 45; i++) gui.setItem(i, borderGlass);
+        for (int i = 0; i < 36; i++) {
+            gui.setItem(i, pane);
+        }
 
-        gui.setItem(10, createFlagItem(Material.GRASS_BLOCK, "Block Break & Place", claim.allowBuild));
-        gui.setItem(11, createFlagItem(Material.CHEST, "Chests & Containers", claim.allowContainers));
-        gui.setItem(12, createFlagItem(Material.OAK_DOOR, "Doors & Fence Gates", claim.allowDoors));
-        gui.setItem(13, createFlagItem(Material.LEVER, "Buttons, Levers & Plates", claim.allowRedstone));
-        gui.setItem(14, createFlagItem(Material.DIAMOND_SWORD, "PvP Combat", claim.allowPvP));
-        gui.setItem(15, createFlagItem(Material.TNT, "TNT & Creeper Explosions", claim.allowExplosions));
-        gui.setItem(16, createFlagItem(Material.ZOMBIE_HEAD, "Monster Spawning", claim.allowMobSpawn));
+        // Row 2: Protection Permissions
+        gui.setItem(10, createFlagItem(Material.GRASS_BLOCK, "Build & Break", claim.allowBuild, "Place or break blocks inside claim"));
+        gui.setItem(11, createFlagItem(Material.CHEST, "Containers", claim.allowContainers, "Open chests, barrels & shulkers"));
+        gui.setItem(12, createFlagItem(Material.OAK_DOOR, "Doors & Gates", claim.allowDoors, "Open doors & fence gates"));
+        gui.setItem(13, createFlagItem(Material.DIAMOND_SWORD, "PvP Combat", claim.allowPvP, "Fight other players in claim"));
+        gui.setItem(14, createFlagItem(Material.TNT, "Explosions", claim.allowExplosions, "TNT & creeper explosion damage"));
+        gui.setItem(15, createFlagItem(Material.ZOMBIE_HEAD, "Mob Spawning", claim.allowMobSpawn, "Hostile monsters spawning"));
+        gui.setItem(16, createFlagItem(Material.FLINT_AND_STEEL, "Fire Spread", claim.allowFireSpread, "Fire & lava block spread"));
 
-        gui.setItem(19, createFlagItem(Material.FLINT_AND_STEEL, "Fire & Lava Spread", claim.allowFireSpread));
-        gui.setItem(20, createFlagItem(Material.EMERALD, "Villager Trading", claim.allowVillagerTrade));
-        gui.setItem(21, createFlagItem(Material.HOPPER, "Item Pickup & Drop", claim.allowItemPickup));
-        gui.setItem(22, createFlagItem(Material.ENDER_PEARL, "Ender Pearl Teleport", claim.allowEnderPearl));
-        gui.setItem(23, createFlagItem(Material.COOKED_BEEF, "Animal Damage", claim.allowAnimalDamage));
-        gui.setItem(24, createFlagItem(Material.WATER_BUCKET, "Water & Lava Buckets", claim.allowBuckets));
-        gui.setItem(25, createFlagItem(Material.PISTON, "Piston Extension", claim.allowPistons));
-
-        gui.setItem(37, createButton(Material.BEACON, ChatColor.AQUA + "Show Glowing Border", Arrays.asList(ChatColor.GRAY + "Display particles around your claim")));
-        gui.setItem(38, createButton(Material.PLAYER_HEAD, ChatColor.LIGHT_PURPLE + "Manage Trusted Players", Arrays.asList(ChatColor.GRAY + "Trusted: " + ChatColor.WHITE + claim.trusted.size(), ChatColor.YELLOW + "Click to view & remove members")));
-        gui.setItem(40, createButton(Material.GOLD_INGOT, ChatColor.GOLD + "Claim Blocks & Info", Arrays.asList(
-                ChatColor.GRAY + "Size: " + ChatColor.WHITE + claim.getWidth() + "x" + claim.getLength() + " (" + claim.getArea() + " blocks)",
-                ChatColor.GRAY + "Available Blocks: " + ChatColor.GREEN + getAvailableBlocks(claim.owner)
-        )));
-        gui.setItem(42, createButton(Material.ENDER_EYE, ChatColor.GREEN + "Teleport to Claim Home", Arrays.asList(ChatColor.GRAY + "Click to teleport to your claim")));
-        gui.setItem(43, createButton(Material.BARRIER, ChatColor.RED + "Unclaim & Refund Blocks", Arrays.asList(ChatColor.GRAY + "Refunds " + ChatColor.GOLD + claim.getArea() + " Claim Blocks")));
+        // Row 3: Claim Management Actions
+        gui.setItem(20, createButton(Material.PLAYER_HEAD, ChatColor.GREEN + "" + ChatColor.BOLD + "Trusted Players",
+                Arrays.asList(ChatColor.GRAY + "Members: " + ChatColor.WHITE + claim.trusted.size(), ChatColor.YELLOW + "Click to manage trusted list")));
+        gui.setItem(21, createButton(Material.ENDER_PEARL, ChatColor.AQUA + "" + ChatColor.BOLD + "Claim Teleport",
+                Collections.singletonList(ChatColor.GRAY + "Open your claims teleport menu")));
+        gui.setItem(22, createButton(Material.PAPER, ChatColor.GOLD + "" + ChatColor.BOLD + "Claim Info",
+                Arrays.asList(
+                        ChatColor.GRAY + "Name: " + ChatColor.AQUA + claim.title + ChatColor.DARK_GRAY + " (#" + claim.number + ")",
+                        ChatColor.GRAY + "Size: " + ChatColor.WHITE + claim.getWidth() + "x" + claim.getLength() + " (" + claim.getArea() + " blocks)",
+                        ChatColor.GRAY + "Blocks Left: " + ChatColor.GREEN + getAvailableBlocks(claim.owner)
+                )));
+        gui.setItem(23, createButton(Material.COMPASS, ChatColor.YELLOW + "" + ChatColor.BOLD + "Show Border",
+                Collections.singletonList(ChatColor.GRAY + "Show Gold corners & border")));
+        gui.setItem(24, createButton(Material.BARRIER, ChatColor.RED + "" + ChatColor.BOLD + "Unclaim",
+                Collections.singletonList(ChatColor.GRAY + "Refund " + ChatColor.GOLD + claim.getArea() + " Claim Blocks")));
 
         player.openInventory(gui);
     }
 
     private void openTrustedGUI(Player player, Claim claim) {
         editingClaim.put(player.getUniqueId(), claim);
-        Inventory gui = Bukkit.createInventory(null, 27, ChatColor.DARK_GRAY + "Trusted Players");
+        Inventory gui = Bukkit.createInventory(null, 27, TRUST_GUI_TITLE);
 
         int slot = 0;
         for (UUID trustedId : claim.trusted) {
@@ -638,25 +766,49 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             if (meta != null) {
                 meta.setOwningPlayer(op);
                 meta.setDisplayName(ChatColor.GREEN + (op.getName() != null ? op.getName() : trustedId.toString()));
-                meta.setLore(Collections.singletonList(ChatColor.RED + "Click to untrust this player!"));
+                meta.setLore(Collections.singletonList(ChatColor.RED + "Click to untrust"));
                 head.setItemMeta(meta);
             }
             gui.setItem(slot++, head);
         }
 
-        gui.setItem(26, createButton(Material.ARROW, ChatColor.YELLOW + "Back to Control Panel", Collections.singletonList(ChatColor.GRAY + "Return to main menu")));
+        gui.setItem(26, createButton(Material.ARROW, ChatColor.YELLOW + "Back", Collections.singletonList(ChatColor.GRAY + "Back to Claim Settings")));
         player.openInventory(gui);
     }
 
-    private ItemStack createFlagItem(Material mat, String name, boolean state) {
+    private void openClaimTPGUI(Player player) {
+        List<Claim> myClaims = getPlayerClaims(player.getUniqueId());
+        Inventory gui = Bukkit.createInventory(null, 27, TP_GUI_TITLE);
+
+        for (int i = 0; i < myClaims.size() && i < 27; i++) {
+            Claim c = myClaims.get(i);
+            ItemStack item = new ItemStack(Material.ENDER_PEARL);
+            ItemMeta meta = item.getItemMeta();
+            if (meta != null) {
+                meta.setDisplayName(ChatColor.GOLD + "#" + c.number + " " + ChatColor.AQUA + c.title);
+                meta.setLore(Arrays.asList(
+                        ChatColor.GRAY + "Size: " + ChatColor.WHITE + c.getWidth() + "x" + c.getLength(),
+                        ChatColor.GRAY + "Coords: " + ChatColor.YELLOW + c.minX + ", " + c.minZ,
+                        ChatColor.GREEN + "Click to teleport"
+                ));
+                item.setItemMeta(meta);
+            }
+            gui.setItem(i, item);
+        }
+
+        player.openInventory(gui);
+    }
+
+    private ItemStack createFlagItem(Material mat, String name, boolean state, String desc) {
         ItemStack item = new ItemStack(mat);
         ItemMeta meta = item.getItemMeta();
         if (meta != null) {
             meta.setDisplayName(ChatColor.GOLD + "" + ChatColor.BOLD + name);
-            List<String> lore = new ArrayList<>();
-            lore.add(state ? ChatColor.GREEN + "Status: ALLOWED (ON)" : ChatColor.RED + "Status: BLOCKED (OFF)");
-            lore.add(ChatColor.GRAY + "Click to toggle!");
-            meta.setLore(lore);
+            meta.setLore(Arrays.asList(
+                    ChatColor.GRAY + desc,
+                    state ? ChatColor.GREEN + "" + ChatColor.BOLD + "Status: ALLOWED" : ChatColor.RED + "" + ChatColor.BOLD + "Status: DENIED",
+                    ChatColor.YELLOW + "Click to toggle"
+            ));
             item.setItemMeta(meta);
         }
         return item;
@@ -666,7 +818,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         ItemStack item = new ItemStack(mat);
         ItemMeta meta = item.getItemMeta();
         if (meta != null) {
-            meta.setDisplayName(ChatColor.BOLD + title);
+            meta.setDisplayName(title);
             meta.setLore(lore);
             item.setItemMeta(meta);
         }
@@ -679,13 +831,24 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         Player player = (Player) event.getWhoClicked();
         String title = event.getView().getTitle();
 
-        if (title.equals(ChatColor.DARK_GRAY + "Trusted Players")) {
+        if (title.equals(TP_GUI_TITLE)) {
+            event.setCancelled(true);
+            int slot = event.getRawSlot();
+            List<Claim> myClaims = getPlayerClaims(player.getUniqueId());
+            if (slot >= 0 && slot < myClaims.size()) {
+                player.closeInventory();
+                teleportToClaim(player, myClaims.get(slot));
+            }
+            return;
+        }
+
+        if (title.equals(TRUST_GUI_TITLE)) {
             event.setCancelled(true);
             Claim claim = editingClaim.get(player.getUniqueId());
             if (claim == null) return;
             int slot = event.getRawSlot();
             if (slot == 26) {
-                openControlPanelGUI(player, claim);
+                openClaimSettingsGUI(player, claim);
                 return;
             }
             ItemStack clicked = event.getCurrentItem();
@@ -694,17 +857,17 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 if (sm.getOwningPlayer() != null) {
                     claim.trusted.remove(sm.getOwningPlayer().getUniqueId());
                     saveData();
-                    player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 1.0f, 1.0f);
+                    player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.1f);
                     openTrustedGUI(player, claim);
                 }
             }
             return;
         }
 
-        if (!title.equals(ChatColor.DARK_GRAY + "Claim Control Panel")) return;
+        if (!title.equals(GUI_TITLE)) return;
         event.setCancelled(true);
         int slot = event.getRawSlot();
-        if (slot < 0 || slot >= 45) return;
+        if (slot < 0 || slot >= 36) return;
 
         Claim claim = editingClaim.get(player.getUniqueId());
         if (claim == null) return;
@@ -712,39 +875,30 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         if (slot == 10) claim.allowBuild = !claim.allowBuild;
         else if (slot == 11) claim.allowContainers = !claim.allowContainers;
         else if (slot == 12) claim.allowDoors = !claim.allowDoors;
-        else if (slot == 13) claim.allowRedstone = !claim.allowRedstone;
-        else if (slot == 14) claim.allowPvP = !claim.allowPvP;
-        else if (slot == 15) claim.allowExplosions = !claim.allowExplosions;
-        else if (slot == 16) claim.allowMobSpawn = !claim.allowMobSpawn;
-        else if (slot == 19) claim.allowFireSpread = !claim.allowFireSpread;
-        else if (slot == 20) claim.allowVillagerTrade = !claim.allowVillagerTrade;
-        else if (slot == 21) claim.allowItemPickup = !claim.allowItemPickup;
-        else if (slot == 22) claim.allowEnderPearl = !claim.allowEnderPearl;
-        else if (slot == 23) claim.allowAnimalDamage = !claim.allowAnimalDamage;
-        else if (slot == 24) claim.allowBuckets = !claim.allowBuckets;
-        else if (slot == 25) claim.allowPistons = !claim.allowPistons;
-        else if (slot == 37) {
-            player.closeInventory();
-            showClaimBorder(player, claim);
-            player.sendMessage(ChatColor.AQUA + "Displaying glowing claim border!");
-            return;
-        } else if (slot == 38) {
+        else if (slot == 13) claim.allowPvP = !claim.allowPvP;
+        else if (slot == 14) claim.allowExplosions = !claim.allowExplosions;
+        else if (slot == 15) claim.allowMobSpawn = !claim.allowMobSpawn;
+        else if (slot == 16) claim.allowFireSpread = !claim.allowFireSpread;
+        else if (slot == 20) {
             openTrustedGUI(player, claim);
             return;
-        } else if (slot == 40) {
-            player.closeInventory();
-            player.performCommand("claim blocks");
+        } else if (slot == 21) {
+            openClaimTPGUI(player);
             return;
-        } else if (slot == 42) {
+        } else if (slot == 22) {
             player.closeInventory();
-            if (claim.home != null) player.teleport(claim.home);
+            player.performCommand("claim info");
             return;
-        } else if (slot == 43) {
+        } else if (slot == 23) {
+            player.closeInventory();
+            showClaimVisuals(player, claim);
+            return;
+        } else if (slot == 24) {
             player.closeInventory();
             int refunded = claim.getArea();
             claims.remove(claim);
             addBlocks(claim.owner, refunded);
-            updateBossBar(player, player.getLocation());
+            handleZoneEntry(player, player.getLocation(), false);
             player.sendMessage(ChatColor.YELLOW + "Unclaimed! Refunded " + ChatColor.GOLD + refunded + " Claim Blocks" + ChatColor.YELLOW + ".");
             return;
         } else {
@@ -753,10 +907,9 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
 
         player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.3f);
         saveData();
-        openControlPanelGUI(player, claim);
+        openClaimSettingsGUI(player, claim);
     }
 
-    // --- YELLOW BOSSBAR & BAN CHECK ---
     @EventHandler
     public void onPlayerMove(PlayerMoveEvent event) {
         if (event.getTo() == null) return;
@@ -768,48 +921,71 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
 
         if (claim != null && !claim.owner.equals(player.getUniqueId()) && !player.isOp() && claim.banned.contains(player.getUniqueId())) {
             event.setCancelled(true);
-            player.sendMessage(ChatColor.RED + "You are banned from entering " + claim.ownerName + "'s claim!");
+            player.sendMessage(ChatColor.RED + "You are banned from entering " + claim.title + "!");
             return;
         }
 
-        updateBossBar(player, event.getTo());
+        handleZoneEntry(player, event.getTo(), false);
     }
 
-    private void updateBossBar(Player player, Location loc) {
+    private void handleZoneEntry(Player player, Location loc, boolean forceTitle) {
         Claim claim = getClaimAt(loc);
-        BossBar bar = playerBossBars.get(player.getUniqueId());
+        UUID uuid = player.getUniqueId();
+        BossBar bar = playerBossBars.get(uuid);
+        String prevId = currentClaimId.get(uuid);
 
         if (claim != null) {
-            String title = ChatColor.YELLOW + "" + ChatColor.BOLD + "⚡ " + claim.title + " ⚡";
+            String bossTitle = ChatColor.YELLOW + "" + ChatColor.BOLD + "⚡ " + claim.title + " ⚡";
             if (bar == null) {
-                bar = Bukkit.createBossBar(title, BarColor.YELLOW, BarStyle.SOLID);
+                bar = Bukkit.createBossBar(bossTitle, BarColor.YELLOW, BarStyle.SOLID);
                 bar.setProgress(1.0);
                 bar.addPlayer(player);
-                playerBossBars.put(player.getUniqueId(), bar);
+                playerBossBars.put(uuid, bar);
             } else {
-                bar.setTitle(title);
+                bar.setTitle(bossTitle);
                 bar.setProgress(1.0);
             }
-        } else if (bar != null) {
-            bar.removePlayer(player);
-            playerBossBars.remove(player.getUniqueId());
+
+            if (forceTitle || !claim.id.equals(prevId)) {
+                currentClaimId.put(uuid, claim.id);
+                player.sendTitle(
+                        ChatColor.GOLD + "" + ChatColor.BOLD + claim.title,
+                        ChatColor.YELLOW + "Owner: " + ChatColor.WHITE + claim.ownerName,
+                        10, 45, 15
+                );
+            }
+        } else {
+            if (prevId != null) {
+                currentClaimId.remove(uuid);
+                player.sendTitle(
+                        ChatColor.GREEN + "" + ChatColor.BOLD + "Wilderness",
+                        ChatColor.GRAY + "Unclaimed Territory",
+                        10, 30, 10
+                );
+            }
+            if (bar != null) {
+                bar.removePlayer(player);
+                playerBossBars.remove(uuid);
+            }
         }
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        corner1Map.remove(event.getPlayer().getUniqueId());
-        BossBar bar = playerBossBars.remove(event.getPlayer().getUniqueId());
+        UUID uuid = event.getPlayer().getUniqueId();
+        corner1Map.remove(uuid);
+        currentClaimId.remove(uuid);
+        editingClaim.remove(uuid);
+        BossBar bar = playerBossBars.remove(uuid);
         if (bar != null) bar.removeAll();
     }
 
-    // --- PROTECTION LISTENERS ---
     @EventHandler
     public void onBreak(BlockBreakEvent event) {
         Claim claim = getClaimAt(event.getBlock().getLocation());
         if (claim != null && !claim.canBypass(event.getPlayer()) && !claim.allowBuild) {
             event.setCancelled(true);
-            event.getPlayer().sendMessage(ChatColor.RED + "You cannot break blocks in this claim!");
+            event.getPlayer().sendMessage(ChatColor.RED + "You cannot break blocks in " + claim.title + "!");
         }
     }
 
@@ -818,7 +994,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         Claim claim = getClaimAt(event.getBlock().getLocation());
         if (claim != null && !claim.canBypass(event.getPlayer()) && !claim.allowBuild) {
             event.setCancelled(true);
-            event.getPlayer().sendMessage(ChatColor.RED + "You cannot place blocks in this claim!");
+            event.getPlayer().sendMessage(ChatColor.RED + "You cannot place blocks in " + claim.title + "!");
         }
     }
 
@@ -832,47 +1008,12 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         if (name.contains("CHEST") || name.contains("FURNACE") || name.equals("BARREL") || name.contains("SHULKER") || name.equals("ANVIL") || name.equals("BREWING_STAND")) {
             if (!claim.allowContainers) {
                 event.setCancelled(true);
-                event.getPlayer().sendMessage(ChatColor.RED + "Containers are locked in this claim!");
+                event.getPlayer().sendMessage(ChatColor.RED + "Containers are locked in " + claim.title + "!");
             }
         } else if (name.contains("DOOR") || name.contains("GATE")) {
             if (!claim.allowDoors) {
                 event.setCancelled(true);
-                event.getPlayer().sendMessage(ChatColor.RED + "Doors are locked in this claim!");
-            }
-        } else if (name.contains("BUTTON") || name.equals("LEVER") || name.contains("PRESSURE_PLATE")) {
-            if (!claim.allowRedstone) {
-                event.setCancelled(true);
-                event.getPlayer().sendMessage(ChatColor.RED + "Buttons and levers are locked in this claim!");
-            }
-        }
-    }
-
-    @EventHandler
-    public void onBucketEmpty(PlayerBucketEmptyEvent event) {
-        Claim claim = getClaimAt(event.getBlock().getLocation());
-        if (claim != null && !claim.canBypass(event.getPlayer()) && !claim.allowBuckets) {
-            event.setCancelled(true);
-            event.getPlayer().sendMessage(ChatColor.RED + "You cannot use buckets in this claim!");
-        }
-    }
-
-    @EventHandler
-    public void onBucketFill(PlayerBucketFillEvent event) {
-        Claim claim = getClaimAt(event.getBlock().getLocation());
-        if (claim != null && !claim.canBypass(event.getPlayer()) && !claim.allowBuckets) {
-            event.setCancelled(true);
-            event.getPlayer().sendMessage(ChatColor.RED + "You cannot use buckets in this claim!");
-        }
-    }
-
-    @EventHandler
-    public void onPistonExtend(BlockPistonExtendEvent event) {
-        Claim sourceClaim = getClaimAt(event.getBlock().getLocation());
-        for (org.bukkit.block.Block b : event.getBlocks()) {
-            Claim targetClaim = getClaimAt(b.getRelative(event.getDirection()).getLocation());
-            if (targetClaim != null && !targetClaim.allowPistons && (sourceClaim == null || !sourceClaim.id.equals(targetClaim.id))) {
-                event.setCancelled(true);
-                return;
+                event.getPlayer().sendMessage(ChatColor.RED + "Doors are locked in " + claim.title + "!");
             }
         }
     }
@@ -884,31 +1025,12 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         else if (event.getDamager() instanceof Projectile && ((Projectile) event.getDamager()).getShooter() instanceof Player) {
             attacker = (Player) ((Projectile) event.getDamager()).getShooter();
         }
-        if (attacker == null) return;
+        if (attacker == null || !(event.getEntity() instanceof Player)) return;
 
         Claim claim = getClaimAt(event.getEntity().getLocation());
-        if (claim == null) return;
-
-        if (event.getEntity() instanceof Player) {
-            if (!claim.allowPvP) {
-                event.setCancelled(true);
-                attacker.sendMessage(ChatColor.RED + "PvP is disabled in this claim!");
-            }
-        } else if (event.getEntity() instanceof Animals) {
-            if (!claim.canBypass(attacker) && !claim.allowAnimalDamage) {
-                event.setCancelled(true);
-                attacker.sendMessage(ChatColor.RED + "You cannot hurt animals in this claim!");
-            }
-        }
-    }
-
-    @EventHandler
-    public void onVillagerTrade(PlayerInteractEntityEvent event) {
-        if (event.getRightClicked().getType() != EntityType.VILLAGER) return;
-        Claim claim = getClaimAt(event.getRightClicked().getLocation());
-        if (claim != null && !claim.canBypass(event.getPlayer()) && !claim.allowVillagerTrade) {
+        if (claim != null && !claim.allowPvP) {
             event.setCancelled(true);
-            event.getPlayer().sendMessage(ChatColor.RED + "Villager trading is disabled in this claim!");
+            attacker.sendMessage(ChatColor.RED + "PvP is disabled in " + claim.title + "!");
         }
     }
 
@@ -941,34 +1063,6 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         if (claim != null && !claim.allowFireSpread) event.setCancelled(true);
     }
 
-    @EventHandler
-    public void onPickup(EntityPickupItemEvent event) {
-        if (!(event.getEntity() instanceof Player)) return;
-        Claim claim = getClaimAt(event.getItem().getLocation());
-        if (claim != null && !claim.canBypass((Player) event.getEntity()) && !claim.allowItemPickup) {
-            event.setCancelled(true);
-        }
-    }
-
-    @EventHandler
-    public void onDrop(PlayerDropItemEvent event) {
-        Claim claim = getClaimAt(event.getPlayer().getLocation());
-        if (claim != null && !claim.canBypass(event.getPlayer()) && !claim.allowItemPickup) {
-            event.setCancelled(true);
-        }
-    }
-
-    @EventHandler
-    public void onPearl(PlayerTeleportEvent event) {
-        if (event.getCause() != PlayerTeleportEvent.TeleportCause.ENDER_PEARL || event.getTo() == null) return;
-        Claim claim = getClaimAt(event.getTo());
-        if (claim != null && !claim.canBypass(event.getPlayer()) && !claim.allowEnderPearl) {
-            event.setCancelled(true);
-            event.getPlayer().sendMessage(ChatColor.RED + "Ender Pearls are disabled in this claim!");
-        }
-    }
-
-    // --- PERMANENT DATA SAVE/LOAD (claims.yml) ---
     private void saveData() {
         if (dataFile == null) dataFile = new File(getDataFolder(), "claims.yml");
         dataConfig = new YamlConfiguration();
@@ -979,6 +1073,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
 
         for (Claim c : claims) {
             String path = "claims." + c.id;
+            dataConfig.set(path + ".number", c.number);
             dataConfig.set(path + ".owner", c.owner.toString());
             dataConfig.set(path + ".ownerName", c.ownerName);
             dataConfig.set(path + ".title", c.title);
@@ -1000,17 +1095,10 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             dataConfig.set(path + ".allowBuild", c.allowBuild);
             dataConfig.set(path + ".allowContainers", c.allowContainers);
             dataConfig.set(path + ".allowDoors", c.allowDoors);
-            dataConfig.set(path + ".allowRedstone", c.allowRedstone);
             dataConfig.set(path + ".allowPvP", c.allowPvP);
             dataConfig.set(path + ".allowExplosions", c.allowExplosions);
             dataConfig.set(path + ".allowMobSpawn", c.allowMobSpawn);
             dataConfig.set(path + ".allowFireSpread", c.allowFireSpread);
-            dataConfig.set(path + ".allowVillagerTrade", c.allowVillagerTrade);
-            dataConfig.set(path + ".allowItemPickup", c.allowItemPickup);
-            dataConfig.set(path + ".allowEnderPearl", c.allowEnderPearl);
-            dataConfig.set(path + ".allowAnimalDamage", c.allowAnimalDamage);
-            dataConfig.set(path + ".allowBuckets", c.allowBuckets);
-            dataConfig.set(path + ".allowPistons", c.allowPistons);
         }
 
         try {
@@ -1033,6 +1121,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             }
         }
 
+        Map<UUID, Integer> ownerCounter = new HashMap<>();
         ConfigurationSection cSec = dataConfig.getConfigurationSection("claims");
         if (cSec != null) {
             for (String id : cSec.getKeys(false)) {
@@ -1045,8 +1134,12 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 int minZ = dataConfig.getInt(path + ".minZ");
                 int maxZ = dataConfig.getInt(path + ".maxZ");
 
+                int nextDefault = ownerCounter.getOrDefault(owner, 0) + 1;
+                ownerCounter.put(owner, nextDefault);
+
                 Claim c = new Claim(id, owner, ownerName, world, minX, maxX, minZ, maxZ);
-                c.title = dataConfig.getString(path + ".title", ownerName + "'s Claim");
+                c.number = dataConfig.getInt(path + ".number", nextDefault);
+                c.title = dataConfig.getString(path + ".title", "claim-" + c.number);
                 c.home = dataConfig.getLocation(path + ".home");
 
                 for (String s : dataConfig.getStringList(path + ".trusted")) c.trusted.add(UUID.fromString(s));
@@ -1055,17 +1148,10 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 c.allowBuild = dataConfig.getBoolean(path + ".allowBuild", false);
                 c.allowContainers = dataConfig.getBoolean(path + ".allowContainers", false);
                 c.allowDoors = dataConfig.getBoolean(path + ".allowDoors", false);
-                c.allowRedstone = dataConfig.getBoolean(path + ".allowRedstone", false);
                 c.allowPvP = dataConfig.getBoolean(path + ".allowPvP", false);
                 c.allowExplosions = dataConfig.getBoolean(path + ".allowExplosions", false);
                 c.allowMobSpawn = dataConfig.getBoolean(path + ".allowMobSpawn", true);
                 c.allowFireSpread = dataConfig.getBoolean(path + ".allowFireSpread", false);
-                c.allowVillagerTrade = dataConfig.getBoolean(path + ".allowVillagerTrade", false);
-                c.allowItemPickup = dataConfig.getBoolean(path + ".allowItemPickup", true);
-                c.allowEnderPearl = dataConfig.getBoolean(path + ".allowEnderPearl", false);
-                c.allowAnimalDamage = dataConfig.getBoolean(path + ".allowAnimalDamage", false);
-                c.allowBuckets = dataConfig.getBoolean(path + ".allowBuckets", false);
-                c.allowPistons = dataConfig.getBoolean(path + ".allowPistons", false);
 
                 claims.add(c);
             }
@@ -1074,6 +1160,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
 
     private static class Claim {
         String id;
+        int number = 1;
         UUID owner;
         String ownerName;
         String title;
@@ -1086,17 +1173,10 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         boolean allowBuild = false;
         boolean allowContainers = false;
         boolean allowDoors = false;
-        boolean allowRedstone = false;
         boolean allowPvP = false;
         boolean allowExplosions = false;
         boolean allowMobSpawn = true;
         boolean allowFireSpread = false;
-        boolean allowVillagerTrade = false;
-        boolean allowItemPickup = true;
-        boolean allowEnderPearl = false;
-        boolean allowAnimalDamage = false;
-        boolean allowBuckets = false;
-        boolean allowPistons = false;
 
         Claim(String id, UUID owner, String ownerName, Location l1, Location l2) {
             this(id, owner, ownerName, l1.getWorld().getName(),
@@ -1108,7 +1188,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             this.id = id;
             this.owner = owner;
             this.ownerName = ownerName;
-            this.title = ownerName + "'s Claim";
+            this.title = "claim-1";
             this.world = world;
             this.minX = minX;
             this.maxX = maxX;
