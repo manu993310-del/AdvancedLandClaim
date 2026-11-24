@@ -16,6 +16,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.*;
 import org.bukkit.event.entity.*;
+import org.bukkit.event.inventory.ClickType;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.event.vehicle.VehicleEnterEvent;
@@ -28,6 +29,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.*;
 
 public class LandClaimPlugin extends JavaPlugin implements Listener, TabCompleter {
@@ -44,8 +46,10 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
     private final Map<UUID, Location> corner1Map = new HashMap<>();
     private final Map<UUID, BossBar> playerBossBars = new HashMap<>();
     private final Map<UUID, String> currentClaimId = new HashMap<>();
+    private final Map<UUID, String> lastVisitedClaimId = new HashMap<>();
     private final Map<UUID, Claim> editingClaim = new HashMap<>();
     private final Map<UUID, UUID> editingMember = new HashMap<>();
+    private final Set<UUID> activeFlyPlayers = new HashSet<>();
 
     private File dataFile;
     private FileConfiguration dataConfig;
@@ -58,6 +62,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         }
         loadData();
 
+        // +10 Claim Blocks every 6 minutes (100 blocks/hour)
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 addBlocks(p.getUniqueId(), 10);
@@ -65,19 +70,29 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             }
         }, 7200L, 7200L);
 
+        // Live ActionBar + Always-Visible Border Particles task
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 Material hand = p.getInventory().getItemInMainHand().getType();
+                Claim standing = getClaimAt(p.getLocation());
                 if (hand == Material.GOLDEN_SHOVEL || hand == Material.STICK) {
-                    Claim standing = getClaimAt(p.getLocation());
                     String zone = (standing == null) ? ChatColor.GREEN + "Wilderness" : ChatColor.YELLOW + standing.title;
                     p.sendActionBar(ChatColor.GOLD + "Claim Blocks: " + ChatColor.WHITE + getAvailableBlocks(p.getUniqueId())
                             + ChatColor.DARK_GRAY + " | " + ChatColor.AQUA + "Zone: " + zone);
                 }
+
+                // Render permanent border particles for nearby claims with alwaysBorder = true
+                for (Claim c : claims) {
+                    if (c.alwaysBorder && c.world.equals(p.getWorld().getName())) {
+                        if (Math.abs(p.getLocation().getBlockX() - c.minX) <= 48 && Math.abs(p.getLocation().getBlockZ() - c.minZ) <= 48) {
+                            spawnBorderParticlesOnce(p, c, p.getLocation().getY() + 0.5);
+                        }
+                    }
+                }
             }
         }, 20L, 20L);
 
-        getLogger().info("AdvancedLandClaim v12.0 Enabled!");
+        getLogger().info("AdvancedLandClaim v13.0 (SimpleClaimSystem V2 Edition) Enabled!");
     }
 
     @Override
@@ -85,6 +100,19 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         saveData();
         for (BossBar bar : playerBossBars.values()) {
             bar.removeAll();
+        }
+        for (UUID u : activeFlyPlayers) {
+            Player p = Bukkit.getPlayer(u);
+            if (p != null && p.getGameMode() == GameMode.SURVIVAL) {
+                p.setAllowFlight(false);
+                p.setFlying(false);
+            }
+        }
+    }
+
+    private void playClaimSound(Player p, Claim claim, Sound sound, float pitch) {
+        if (claim == null || claim.soundsEnabled) {
+            p.playSound(p.getLocation(), sound, 0.9f, pitch);
         }
     }
 
@@ -139,6 +167,14 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         return null;
     }
 
+    private Claim getClaimById(String id) {
+        if (id == null) return null;
+        for (Claim c : claims) {
+            if (c.id.equals(id)) return c;
+        }
+        return null;
+    }
+
     private boolean createClaim(Player player, Location pos1, Location pos2) {
         UUID uuid = player.getUniqueId();
         int nextNum = getNextClaimNumber(uuid);
@@ -168,17 +204,34 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         }
 
         newClaim.home = player.getLocation();
+        newClaim.addLog("Claim created by " + player.getName() + " (" + needed + " blocks)");
         setAvailableBlocks(uuid, available - needed);
         claims.add(newClaim);
         saveData();
 
-        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.9f, 1.4f);
+        playClaimSound(player, newClaim, Sound.UI_TOAST_CHALLENGE_COMPLETE, 1.2f);
         showClaimVisuals(player, newClaim);
         handleZoneEntry(player, player.getLocation(), true);
 
         player.sendMessage(ChatColor.GREEN + "Created " + ChatColor.GOLD + newClaim.title + ChatColor.GREEN + " (" + ChatColor.YELLOW + newClaim.getWidth() + "x" + newClaim.getLength() + " = " + needed + " blocks" + ChatColor.GREEN + ").");
         player.sendMessage(ChatColor.GRAY + "Remaining Blocks: " + ChatColor.YELLOW + getAvailableBlocks(uuid) + ChatColor.GRAY + " | Use " + ChatColor.AQUA + "/claim setting" + ChatColor.GRAY + " or " + ChatColor.AQUA + "/claim tp" + ChatColor.GRAY + ".");
         return true;
+    }
+
+    private void spawnBorderParticlesOnce(Player player, Claim claim, double y) {
+        int minX = claim.minX;
+        int maxX = claim.maxX + 1;
+        int minZ = claim.minZ;
+        int maxZ = claim.maxZ + 1;
+
+        for (int x = minX; x <= maxX; x += 2) {
+            player.spawnParticle(Particle.HAPPY_VILLAGER, x, y, minZ, 1, 0, 0, 0, 0);
+            player.spawnParticle(Particle.HAPPY_VILLAGER, x, y, maxZ, 1, 0, 0, 0, 0);
+        }
+        for (int z = minZ; z <= maxZ; z += 2) {
+            player.spawnParticle(Particle.HAPPY_VILLAGER, minX, y, z, 1, 0, 0, 0, 0);
+            player.spawnParticle(Particle.HAPPY_VILLAGER, maxX, y, z, 1, 0, 0, 0, 0);
+        }
     }
 
     private void showClaimVisuals(Player player, Claim claim) {
@@ -216,19 +269,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             @Override
             public void run() {
                 if (count >= 8 || !player.isOnline()) return;
-                int minX = claim.minX;
-                int maxX = claim.maxX + 1;
-                int minZ = claim.minZ;
-                int maxZ = claim.maxZ + 1;
-
-                for (int x = minX; x <= maxX; x++) {
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, x, particleY, minZ, 1, 0, 0, 0, 0);
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, x, particleY, maxZ, 1, 0, 0, 0, 0);
-                }
-                for (int z = minZ; z <= maxZ; z++) {
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, minX, particleY, z, 1, 0, 0, 0, 0);
-                    player.spawnParticle(Particle.HAPPY_VILLAGER, maxX, particleY, z, 1, 0, 0, 0, 0);
-                }
+                spawnBorderParticlesOnce(player, claim, particleY);
                 count++;
             }
         }, 0L, 15L);
@@ -251,7 +292,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_BASS, 0.8f, 1.0f);
                 player.sendMessage(ChatColor.GREEN + "This area is UNCLAIMED (Wilderness).");
             } else {
-                player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_PLING, 0.9f, 1.5f);
+                playClaimSound(player, found, Sound.BLOCK_NOTE_BLOCK_PLING, 1.5f);
                 showClaimVisuals(player, found);
                 player.sendMessage(ChatColor.GOLD + "====================================");
                 player.sendMessage(ChatColor.RED + "" + ChatColor.BOLD + "ALREADY CLAIMED! " + ChatColor.YELLOW + "Owner: " + ChatColor.WHITE + found.ownerName);
@@ -338,6 +379,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
 
         String sub = args[0].toLowerCase();
 
+        // /claim tp [number|claim-1|name]
         if (sub.equals("tp")) {
             List<Claim> myClaims = getPlayerClaims(uuid);
             if (myClaims.isEmpty()) {
@@ -358,6 +400,19 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             return true;
         }
 
+        // /claim back -> Return to previously visited claim
+        if (sub.equals("back")) {
+            String lastId = lastVisitedClaimId.get(uuid);
+            Claim last = getClaimById(lastId);
+            if (last == null) {
+                player.sendMessage(ChatColor.RED + "No previously visited claim found!");
+                return true;
+            }
+            teleportToClaim(player, last);
+            return true;
+        }
+
+        // /claim sethome [number|claim-1]
         if (sub.equals("sethome")) {
             List<Claim> myClaims = getPlayerClaims(uuid);
             Claim target = null;
@@ -376,12 +431,14 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 return true;
             }
             target.home = player.getLocation();
+            target.addLog("Home location updated by " + player.getName());
             saveData();
-            player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.2f);
+            playClaimSound(player, target, Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.3f);
             player.sendMessage(ChatColor.GREEN + "Claim home set for " + ChatColor.GOLD + target.title + ChatColor.GREEN + "!");
             return true;
         }
 
+        // /claim list
         if (sub.equals("list")) {
             List<Claim> myClaims = getPlayerClaims(uuid);
             player.sendMessage(ChatColor.GOLD + "=== Your Claims (" + myClaims.size() + " | Available: " + getAvailableBlocks(uuid) + " blocks) ===");
@@ -389,7 +446,8 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 player.sendMessage(ChatColor.GRAY + "No claims yet. Type /claim to create claim-1.");
             } else {
                 for (Claim c : myClaims) {
-                    player.sendMessage(ChatColor.GOLD + "#" + c.number + " " + ChatColor.AQUA + c.title
+                    String star = c.favorite ? ChatColor.YELLOW + "★ " : "";
+                    player.sendMessage(star + ChatColor.GOLD + "#" + c.number + " " + ChatColor.AQUA + c.title
                             + ChatColor.GRAY + " [" + c.getWidth() + "x" + c.getLength() + " = " + c.getArea() + " blocks]"
                             + ChatColor.YELLOW + " (X:" + c.minX + ", Z:" + c.minZ + ")");
                 }
@@ -397,6 +455,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             return true;
         }
 
+        // /claim rename [number|claim-1] <name>
         if (sub.equals("rename")) {
             if (args.length < 2) {
                 player.sendMessage(ChatColor.YELLOW + "Usage: /claim rename <name> OR /claim rename <number|claim-1> <name>");
@@ -428,13 +487,15 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 return true;
             }
             targetClaim.title = newName;
+            targetClaim.addLog("Renamed to '" + newName + "' by " + player.getName());
             saveData();
             handleZoneEntry(player, player.getLocation(), true);
-            player.playSound(player.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.3f);
+            playClaimSound(player, targetClaim, Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.3f);
             player.sendMessage(ChatColor.GREEN + "Renamed #" + targetClaim.number + " to: " + ChatColor.GOLD + targetClaim.title);
             return true;
         }
 
+        // /claim blocks
         if (sub.equals("blocks")) {
             int avail = getAvailableBlocks(uuid);
             int used = getUsedBlocks(uuid);
@@ -445,6 +506,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             return true;
         }
 
+        // /claim info
         if (sub.equals("info")) {
             Claim c = getClaimAt(player.getLocation());
             if (c == null) {
@@ -460,6 +522,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             return true;
         }
 
+        // /claim unclaimall
         if (sub.equals("unclaimall")) {
             int refunded = 0;
             int count = 0;
@@ -482,6 +545,34 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             return true;
         }
 
+        // /claim fly -> Toggle fly inside own/trusted claim
+        if (sub.equals("fly")) {
+            Claim c = getClaimAt(player.getLocation());
+            if (c == null || (!c.isOwnerOrOp(player) && !c.isTrusted(player))) {
+                player.sendMessage(ChatColor.RED + "Stand inside your claim to use Claim Fly!");
+                return true;
+            }
+            if (!c.allowFly && !player.isOp()) {
+                player.sendMessage(ChatColor.RED + "Claim Fly is disabled in " + c.title + "! Enable it in /claim setting.");
+                return true;
+            }
+            if (activeFlyPlayers.contains(uuid)) {
+                activeFlyPlayers.remove(uuid);
+                if (player.getGameMode() == GameMode.SURVIVAL) {
+                    player.setAllowFlight(false);
+                    player.setFlying(false);
+                }
+                player.sendMessage(ChatColor.YELLOW + "Claim Fly: " + ChatColor.RED + "OFF");
+            } else {
+                activeFlyPlayers.add(uuid);
+                player.setAllowFlight(true);
+                player.setFlying(true);
+                playClaimSound(player, c, Sound.ENTITY_PHANTOM_FLAP, 1.3f);
+                player.sendMessage(ChatColor.YELLOW + "Claim Fly: " + ChatColor.GREEN + "ON");
+            }
+            return true;
+        }
+
         Claim claim = getClaimAt(player.getLocation());
         if (claim == null || (!claim.owner.equals(uuid) && !player.isOp())) {
             if (sub.equals("help")) sendHelp(player);
@@ -491,6 +582,32 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
 
         if (sub.equals("setting")) {
             openClaimSettingsGUI(player, claim);
+            return true;
+        }
+
+        if (sub.equals("icon")) {
+            ItemStack hand = player.getInventory().getItemInMainHand();
+            if (hand.getType() == Material.AIR) {
+                player.sendMessage(ChatColor.RED + "Hold an item in your hand to set it as this claim's icon!");
+                return true;
+            }
+            claim.icon = hand.getType();
+            claim.addLog("Icon changed to " + hand.getType().name() + " by " + player.getName());
+            saveData();
+            playClaimSound(player, claim, Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1.4f);
+            player.sendMessage(ChatColor.GREEN + "Claim icon updated to " + ChatColor.GOLD + hand.getType().name() + ChatColor.GREEN + "!");
+            return true;
+        }
+
+        if (sub.equals("logs")) {
+            player.sendMessage(ChatColor.GOLD + "=== Audit Logs: " + claim.title + " ===");
+            if (claim.auditLogs.isEmpty()) {
+                player.sendMessage(ChatColor.GRAY + "No logs recorded yet.");
+            } else {
+                for (String log : claim.auditLogs) {
+                    player.sendMessage(ChatColor.GRAY + "- " + ChatColor.WHITE + log);
+                }
+            }
             return true;
         }
 
@@ -540,6 +657,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 claim.maxX = expanded.maxX;
                 claim.minZ = expanded.minZ;
                 claim.maxZ = expanded.maxZ;
+                claim.addLog("Expanded by " + amount + " blocks (" + player.getName() + ")");
                 setAvailableBlocks(uuid, avail - extraBlocks);
                 saveData();
                 showClaimVisuals(player, claim);
@@ -563,6 +681,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             claim.trusted.add(target.getUniqueId());
             claim.getMemberPerms(target.getUniqueId());
             claim.banned.remove(target.getUniqueId());
+            claim.addLog("Trusted " + target.getName() + " by " + player.getName());
             saveData();
             player.sendMessage(ChatColor.GREEN + "Trusted " + ChatColor.GOLD + target.getName() + ChatColor.GREEN + " in " + claim.title + "!");
             target.sendMessage(ChatColor.GREEN + "You are now trusted in " + ChatColor.GOLD + claim.title + ChatColor.GREEN + "!");
@@ -577,6 +696,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             Player target = Bukkit.getPlayer(args[1]);
             if (target != null && claim.trusted.remove(target.getUniqueId())) {
                 claim.memberPerms.remove(target.getUniqueId());
+                claim.addLog("Untrusted " + target.getName() + " by " + player.getName());
                 saveData();
                 player.sendMessage(ChatColor.YELLOW + "Removed " + target.getName() + " from trusted players.");
             } else {
@@ -598,6 +718,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             claim.banned.add(target.getUniqueId());
             claim.trusted.remove(target.getUniqueId());
             claim.memberPerms.remove(target.getUniqueId());
+            claim.addLog("Banned " + target.getName() + " by " + player.getName());
             saveData();
             player.sendMessage(ChatColor.RED + "Banned " + ChatColor.GOLD + target.getName() + ChatColor.RED + " from " + claim.title + "!");
             if (claim.contains(target.getLocation())) {
@@ -614,6 +735,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             }
             Player target = Bukkit.getPlayer(args[1]);
             if (target != null && claim.banned.remove(target.getUniqueId())) {
+                claim.addLog("Unbanned " + target.getName() + " by " + player.getName());
                 saveData();
                 player.sendMessage(ChatColor.GREEN + "Unbanned " + target.getName() + ".");
             } else {
@@ -657,7 +779,10 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             dest = new Location(w, cx + 0.5, cy, cz + 0.5);
         }
         player.teleport(dest);
-        player.playSound(player.getLocation(), Sound.ENTITY_ENDERMAN_TELEPORT, 1.0f, 1.2f);
+        // Custom Teleport Sound System
+        playClaimSound(player, claim, Sound.ENTITY_ENDERMAN_TELEPORT, 1.15f);
+        playClaimSound(player, claim, Sound.BLOCK_AMETHYST_BLOCK_CHIME, 1.4f);
+        player.spawnParticle(Particle.PORTAL, player.getLocation().add(0, 1, 0), 25, 0.4, 0.5, 0.4, 0.1);
         player.sendMessage(ChatColor.GREEN + "Teleported to " + ChatColor.GOLD + claim.title + ChatColor.GRAY + " (#" + claim.number + ")");
     }
 
@@ -666,20 +791,20 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         player.sendMessage(ChatColor.YELLOW + "/claim" + ChatColor.GRAY + " - Claim 10x10 area (claim-1, claim-2...)");
         player.sendMessage(ChatColor.YELLOW + "/claim setting" + ChatColor.GRAY + " - Open Claim Settings & Member Settings");
         player.sendMessage(ChatColor.YELLOW + "/claim tp [number|claim-1|name]" + ChatColor.GRAY + " - Teleport to a claim");
-        player.sendMessage(ChatColor.YELLOW + "/claim sethome [number|claim-1]" + ChatColor.GRAY + " - Set claim teleport point");
-        player.sendMessage(ChatColor.YELLOW + "/claim rename [number|claim-1] <name>" + ChatColor.GRAY + " - Rename a claim");
+        player.sendMessage(ChatColor.YELLOW + "/claim back" + ChatColor.GRAY + " - Return to previously visited claim");
+        player.sendMessage(ChatColor.YELLOW + "/claim sethome | rename | icon" + ChatColor.GRAY + " - Customize home, name & icon");
+        player.sendMessage(ChatColor.YELLOW + "/claim fly | logs | border | blocks" + ChatColor.GRAY + " - Fly, audit logs & claim info");
         player.sendMessage(ChatColor.YELLOW + "/claim trust | untrust <player>" + ChatColor.GRAY + " - Trust or untrust a player");
         player.sendMessage(ChatColor.YELLOW + "/claim ban | unban | kick <player>" + ChatColor.GRAY + " - Manage visitors");
-        player.sendMessage(ChatColor.YELLOW + "/claim list | border | blocks" + ChatColor.GRAY + " - View & manage claims");
         player.sendMessage(ChatColor.YELLOW + "/claim expand <blocks> | unclaim" + ChatColor.GRAY + " - Expand or unclaim land");
     }
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         List<String> allSubs = Arrays.asList(
-                "setting", "tp", "sethome", "trust", "untrust", "ban", "unban",
-                "kick", "list", "rename", "border", "blocks", "expand",
-                "unclaim", "unclaimall", "info", "help"
+                "setting", "tp", "back", "sethome", "rename", "icon", "fly",
+                "logs", "trust", "untrust", "ban", "unban", "kick",
+                "list", "border", "blocks", "expand", "unclaim", "unclaimall", "info", "help"
         );
         if (args.length == 1) {
             String prefix = args[0].toLowerCase();
@@ -701,9 +826,10 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         return Collections.emptyList();
     }
 
+    // --- 54-SLOT SIMPLECLAIMSYSTEM V2 STYLE "Claim Settings" GUI ---
     private void openClaimSettingsGUI(Player player, Claim claim) {
         editingClaim.put(player.getUniqueId(), claim);
-        Inventory gui = Bukkit.createInventory(null, 45, GUI_TITLE);
+        Inventory gui = Bukkit.createInventory(null, 54, GUI_TITLE);
 
         ItemStack pane = new ItemStack(Material.GRAY_STAINED_GLASS_PANE);
         ItemMeta pm = pane.getItemMeta();
@@ -711,10 +837,11 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             pm.setDisplayName(" ");
             pane.setItemMeta(pm);
         }
-        for (int i = 0; i < 45; i++) {
+        for (int i = 0; i < 54; i++) {
             gui.setItem(i, pane);
         }
 
+        // Top Row (Slots 0-8): Trusted Members Heads
         int mSlot = 0;
         for (UUID trustedId : claim.trusted) {
             if (mSlot >= 9) break;
@@ -730,6 +857,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             gui.setItem(mSlot++, head);
         }
 
+        // Row 2 (Slots 10-16): Core Protection Flags
         gui.setItem(10, createFlagItem(Material.GRASS_BLOCK, "Build & Break", claim.allowBuild, "Place or break blocks"));
         gui.setItem(11, createFlagItem(Material.CHEST, "Containers", claim.allowContainers, "Chests, barrels & shulkers"));
         gui.setItem(12, createFlagItem(Material.OAK_DOOR, "Doors", claim.allowDoors, "Wooden & iron doors"));
@@ -738,6 +866,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         gui.setItem(15, createFlagItem(Material.EMERALD, "Villagers", claim.allowVillagers, "Trade & interact with villagers"));
         gui.setItem(16, createFlagItem(Material.DIAMOND_SWORD, "PvP", claim.allowPvP, "Player vs Player combat"));
 
+        // Row 3 (Slots 19-25): World & Movement Flags
         gui.setItem(19, createFlagItem(Material.TNT, "Explosions", claim.allowExplosions, "TNT & creeper explosions"));
         gui.setItem(20, createFlagItem(Material.FLINT_AND_STEEL, "Fire Spread", claim.allowFireSpread, "Fire & lava spread"));
         gui.setItem(21, createFlagItem(Material.ENDER_PEARL, "Teleport In", claim.allowTeleportIn, "Allow players to TP into claim"));
@@ -746,20 +875,28 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         gui.setItem(24, createFlagItem(Material.OAK_BOAT, "Boats", claim.allowBoats, "Place & ride boats in claim"));
         gui.setItem(25, createFlagItem(Material.ZOMBIE_HEAD, "Mob Spawning", claim.allowMobSpawn, "Hostile monster spawning"));
 
-        gui.setItem(36, createButton(Material.NAME_TAG, ChatColor.GREEN + "" + ChatColor.BOLD + "Member Settings",
+        // Row 4 (Slots 29-33): SimpleClaimSystem V2 Premium Features
+        gui.setItem(29, createFlagItem(Material.FEATHER, "Claim Fly", claim.allowFly, "Allow flying inside this claim"));
+        gui.setItem(30, createFlagItem(Material.BEACON, "Permanent Border", claim.alwaysBorder, "Keep border particles always visible"));
+        gui.setItem(31, createFlagItem(Material.NOTE_BLOCK, "Custom Sounds", claim.soundsEnabled, "Teleport & claim sound effects"));
+        gui.setItem(32, createFlagItem(Material.RESPAWN_ANCHOR, "Claim Respawn", claim.claimRespawn, "Respawn at claim home on death"));
+        gui.setItem(33, createFlagItem(Material.NETHER_STAR, "Favorite Claim", claim.favorite, "Mark this claim as Favorite"));
+
+        // Bottom Row (Slots 45-53): Actions
+        gui.setItem(45, createButton(Material.NAME_TAG, ChatColor.GREEN + "" + ChatColor.BOLD + "Member Settings",
                 Arrays.asList(ChatColor.GRAY + "Trusted Members: " + ChatColor.WHITE + claim.trusted.size(),
                         ChatColor.YELLOW + "Click to manage member permissions")));
-        gui.setItem(38, createButton(Material.ENDER_EYE, ChatColor.AQUA + "" + ChatColor.BOLD + "Claim Teleport",
+        gui.setItem(47, createButton(Material.ENDER_EYE, ChatColor.AQUA + "" + ChatColor.BOLD + "Claim Teleport",
                 Collections.singletonList(ChatColor.GRAY + "Open your claims teleport menu")));
-        gui.setItem(40, createButton(Material.LIGHTNING_ROD, ChatColor.YELLOW + "" + ChatColor.BOLD + "Show Border",
-                Collections.singletonList(ChatColor.GRAY + "Show corner markers & border")));
-        gui.setItem(42, createButton(Material.PAPER, ChatColor.GOLD + "" + ChatColor.BOLD + "Claim Info",
+        gui.setItem(49, createButton(Material.BOOK, ChatColor.LIGHT_PURPLE + "" + ChatColor.BOLD + "Audit Logs",
+                Collections.singletonList(ChatColor.GRAY + "View recent actions in this claim")));
+        gui.setItem(51, createButton(Material.PAPER, ChatColor.GOLD + "" + ChatColor.BOLD + "Claim Info",
                 Arrays.asList(
                         ChatColor.GRAY + "Name: " + ChatColor.AQUA + claim.title + ChatColor.DARK_GRAY + " (#" + claim.number + ")",
                         ChatColor.GRAY + "Size: " + ChatColor.WHITE + claim.getWidth() + "x" + claim.getLength() + " (" + claim.getArea() + " blocks)",
                         ChatColor.GRAY + "Trusted: " + ChatColor.GREEN + claim.trusted.size()
                 )));
-        gui.setItem(44, createButton(Material.BARRIER, ChatColor.RED + "" + ChatColor.BOLD + "Unclaim",
+        gui.setItem(53, createButton(Material.BARRIER, ChatColor.RED + "" + ChatColor.BOLD + "Unclaim",
                 Collections.singletonList(ChatColor.GRAY + "Refund " + ChatColor.GOLD + claim.getArea() + " Claim Blocks")));
 
         player.openInventory(gui);
@@ -823,19 +960,24 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
     }
 
     private void openClaimTPGUI(Player player) {
-        List<Claim> myClaims = getPlayerClaims(player.getUniqueId());
+        List<Claim> myClaims = new ArrayList<>(getPlayerClaims(player.getUniqueId()));
+        // Sort favorites first
+        myClaims.sort((a, b) -> Boolean.compare(b.favorite, a.favorite));
+
         Inventory gui = Bukkit.createInventory(null, 27, TP_GUI_TITLE);
 
         for (int i = 0; i < myClaims.size() && i < 27; i++) {
             Claim c = myClaims.get(i);
-            ItemStack item = new ItemStack(Material.ENDER_PEARL);
+            ItemStack item = new ItemStack(c.icon != null ? c.icon : Material.ENDER_PEARL);
             ItemMeta meta = item.getItemMeta();
             if (meta != null) {
-                meta.setDisplayName(ChatColor.GOLD + "#" + c.number + " " + ChatColor.AQUA + c.title);
+                String star = c.favorite ? ChatColor.YELLOW + "★ " : "";
+                meta.setDisplayName(star + ChatColor.GOLD + "#" + c.number + " " + ChatColor.AQUA + c.title);
                 meta.setLore(Arrays.asList(
                         ChatColor.GRAY + "Size: " + ChatColor.WHITE + c.getWidth() + "x" + c.getLength(),
                         ChatColor.GRAY + "Coords: " + ChatColor.YELLOW + c.minX + ", " + c.minZ,
-                        ChatColor.GREEN + "Click to teleport"
+                        ChatColor.GREEN + "Left-Click: Teleport",
+                        ChatColor.YELLOW + "Right-Click: Toggle Favorite"
                 ));
                 item.setItemMeta(meta);
             }
@@ -880,10 +1022,20 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         if (title.equals(TP_GUI_TITLE)) {
             event.setCancelled(true);
             int slot = event.getRawSlot();
-            List<Claim> myClaims = getPlayerClaims(player.getUniqueId());
+            List<Claim> myClaims = new ArrayList<>(getPlayerClaims(player.getUniqueId()));
+            myClaims.sort((a, b) -> Boolean.compare(b.favorite, a.favorite));
+
             if (slot >= 0 && slot < myClaims.size()) {
-                player.closeInventory();
-                teleportToClaim(player, myClaims.get(slot));
+                Claim selected = myClaims.get(slot);
+                if (event.getClick() == ClickType.RIGHT || event.getClick() == ClickType.SHIFT_RIGHT) {
+                    selected.favorite = !selected.favorite;
+                    saveData();
+                    playClaimSound(player, selected, Sound.UI_BUTTON_CLICK, 1.3f);
+                    openClaimTPGUI(player);
+                } else {
+                    player.closeInventory();
+                    teleportToClaim(player, selected);
+                }
             }
             return;
         }
@@ -901,7 +1053,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             if (clicked != null && clicked.getType() == Material.PLAYER_HEAD && clicked.getItemMeta() instanceof SkullMeta) {
                 SkullMeta sm = (SkullMeta) clicked.getItemMeta();
                 if (sm.getOwningPlayer() != null) {
-                    player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.2f);
+                    playClaimSound(player, claim, Sound.UI_BUTTON_CLICK, 1.2f);
                     openSingleMemberGUI(player, claim, sm.getOwningPlayer().getUniqueId());
                 }
             }
@@ -923,7 +1075,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 claim.trusted.remove(memberUUID);
                 claim.memberPerms.remove(memberUUID);
                 saveData();
-                player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.0f);
+                playClaimSound(player, claim, Sound.UI_BUTTON_CLICK, 1.0f);
                 openMemberSettingsListGUI(player, claim);
                 return;
             }
@@ -938,7 +1090,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             else if (slot == 16) perms.canVillagers = !perms.canVillagers;
             else return;
 
-            player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.3f);
+            playClaimSound(player, claim, Sound.UI_BUTTON_CLICK, 1.3f);
             saveData();
             openSingleMemberGUI(player, claim, memberUUID);
             return;
@@ -947,7 +1099,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         if (!title.equals(GUI_TITLE)) return;
         event.setCancelled(true);
         int slot = event.getRawSlot();
-        if (slot < 0 || slot >= 45) return;
+        if (slot < 0 || slot >= 54) return;
 
         Claim claim = editingClaim.get(player.getUniqueId());
         if (claim == null) return;
@@ -957,7 +1109,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             if (clicked != null && clicked.getType() == Material.PLAYER_HEAD && clicked.getItemMeta() instanceof SkullMeta) {
                 SkullMeta sm = (SkullMeta) clicked.getItemMeta();
                 if (sm.getOwningPlayer() != null) {
-                    player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.2f);
+                    playClaimSound(player, claim, Sound.UI_BUTTON_CLICK, 1.2f);
                     openSingleMemberGUI(player, claim, sm.getOwningPlayer().getUniqueId());
                 }
             }
@@ -978,21 +1130,26 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         else if (slot == 23) claim.allowWindBurst = !claim.allowWindBurst;
         else if (slot == 24) claim.allowBoats = !claim.allowBoats;
         else if (slot == 25) claim.allowMobSpawn = !claim.allowMobSpawn;
-        else if (slot == 36) {
+        else if (slot == 29) claim.allowFly = !claim.allowFly;
+        else if (slot == 30) claim.alwaysBorder = !claim.alwaysBorder;
+        else if (slot == 31) claim.soundsEnabled = !claim.soundsEnabled;
+        else if (slot == 32) claim.claimRespawn = !claim.claimRespawn;
+        else if (slot == 33) claim.favorite = !claim.favorite;
+        else if (slot == 45) {
             openMemberSettingsListGUI(player, claim);
             return;
-        } else if (slot == 38) {
+        } else if (slot == 47) {
             openClaimTPGUI(player);
             return;
-        } else if (slot == 40) {
+        } else if (slot == 49) {
             player.closeInventory();
-            showClaimVisuals(player, claim);
+            player.performCommand("claim logs");
             return;
-        } else if (slot == 42) {
+        } else if (slot == 51) {
             player.closeInventory();
             player.performCommand("claim info");
             return;
-        } else if (slot == 44) {
+        } else if (slot == 53) {
             player.closeInventory();
             int refunded = claim.getArea();
             claims.remove(claim);
@@ -1004,9 +1161,21 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             return;
         }
 
-        player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, 0.8f, 1.3f);
+        playClaimSound(player, claim, Sound.UI_BUTTON_CLICK, 1.3f);
         saveData();
         openClaimSettingsGUI(player, claim);
+    }
+
+    @EventHandler
+    public void onPlayerRespawn(PlayerRespawnEvent event) {
+        Player player = event.getPlayer();
+        String lastId = currentClaimId.get(player.getUniqueId());
+        Claim claim = getClaimById(lastId);
+        if (claim != null && claim.claimRespawn && (claim.isOwnerOrOp(player) || claim.isTrusted(player))) {
+            if (claim.home != null) {
+                event.setRespawnLocation(claim.home);
+            }
+        }
     }
 
     @EventHandler
@@ -1022,6 +1191,18 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             event.setCancelled(true);
             player.sendMessage(ChatColor.RED + "You are banned from entering " + claim.title + "!");
             return;
+        }
+
+        // Disable Claim Fly when stepping outside claim
+        if (activeFlyPlayers.contains(player.getUniqueId())) {
+            if (claim == null || (!claim.allowFly && !player.isOp()) || (!claim.isOwnerOrOp(player) && !claim.isTrusted(player))) {
+                activeFlyPlayers.remove(player.getUniqueId());
+                if (player.getGameMode() == GameMode.SURVIVAL) {
+                    player.setAllowFlight(false);
+                    player.setFlying(false);
+                }
+                player.sendMessage(ChatColor.YELLOW + "Left claim area — Claim Fly disabled.");
+            }
         }
 
         handleZoneEntry(player, event.getTo(), false);
@@ -1088,7 +1269,11 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             }
 
             if (forceTitle || !claim.id.equals(prevId)) {
+                if (prevId != null && !prevId.equals(claim.id)) {
+                    lastVisitedClaimId.put(uuid, prevId);
+                }
                 currentClaimId.put(uuid, claim.id);
+                playClaimSound(player, claim, Sound.BLOCK_NOTE_BLOCK_CHIME, 1.3f);
                 player.sendTitle(
                         ChatColor.GOLD + "" + ChatColor.BOLD + claim.title,
                         ChatColor.YELLOW + "Owner: " + ChatColor.WHITE + claim.ownerName,
@@ -1097,6 +1282,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             }
         } else {
             if (prevId != null) {
+                lastVisitedClaimId.put(uuid, prevId);
                 currentClaimId.remove(uuid);
                 player.sendTitle(
                         ChatColor.GREEN + "" + ChatColor.BOLD + "Wilderness",
@@ -1118,6 +1304,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         currentClaimId.remove(uuid);
         editingClaim.remove(uuid);
         editingMember.remove(uuid);
+        activeFlyPlayers.remove(uuid);
         BossBar bar = playerBossBars.remove(uuid);
         if (bar != null) bar.removeAll();
     }
@@ -1132,6 +1319,8 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             if (!mp.canBreak) {
                 event.setCancelled(true);
                 event.getPlayer().sendMessage(ChatColor.RED + "Breaking blocks is disabled for you in " + claim.title + "!");
+            } else {
+                claim.addLog(event.getPlayer().getName() + " broke " + event.getBlock().getType().name());
             }
             return;
         }
@@ -1152,6 +1341,8 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             if (!mp.canPlace) {
                 event.setCancelled(true);
                 event.getPlayer().sendMessage(ChatColor.RED + "Placing blocks is disabled for you in " + claim.title + "!");
+            } else {
+                claim.addLog(event.getPlayer().getName() + " placed " + event.getBlock().getType().name());
             }
             return;
         }
@@ -1279,6 +1470,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             dataConfig.set(path + ".owner", c.owner.toString());
             dataConfig.set(path + ".ownerName", c.ownerName);
             dataConfig.set(path + ".title", c.title);
+            dataConfig.set(path + ".icon", c.icon.name());
             dataConfig.set(path + ".world", c.world);
             dataConfig.set(path + ".minX", c.minX);
             dataConfig.set(path + ".maxX", c.maxX);
@@ -1304,6 +1496,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             List<String> bannedList = new ArrayList<>();
             for (UUID u : c.banned) bannedList.add(u.toString());
             dataConfig.set(path + ".banned", bannedList);
+            dataConfig.set(path + ".logs", c.auditLogs);
 
             dataConfig.set(path + ".allowBuild", c.allowBuild);
             dataConfig.set(path + ".allowContainers", c.allowContainers);
@@ -1319,6 +1512,11 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             dataConfig.set(path + ".allowRtpTeleport", c.allowRtpTeleport);
             dataConfig.set(path + ".allowWindBurst", c.allowWindBurst);
             dataConfig.set(path + ".allowBoats", c.allowBoats);
+            dataConfig.set(path + ".allowFly", c.allowFly);
+            dataConfig.set(path + ".alwaysBorder", c.alwaysBorder);
+            dataConfig.set(path + ".soundsEnabled", c.soundsEnabled);
+            dataConfig.set(path + ".claimRespawn", c.claimRespawn);
+            dataConfig.set(path + ".favorite", c.favorite);
         }
 
         try {
@@ -1360,6 +1558,11 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 Claim c = new Claim(id, owner, ownerName, world, minX, maxX, minZ, maxZ);
                 c.number = dataConfig.getInt(path + ".number", nextDefault);
                 c.title = dataConfig.getString(path + ".title", "claim-" + c.number);
+                try {
+                    c.icon = Material.valueOf(dataConfig.getString(path + ".icon", "ENDER_PEARL"));
+                } catch (IllegalArgumentException ignored) {
+                    c.icon = Material.ENDER_PEARL;
+                }
                 c.home = dataConfig.getLocation(path + ".home");
 
                 for (String s : dataConfig.getStringList(path + ".trusted")) {
@@ -1377,6 +1580,7 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 }
 
                 for (String s : dataConfig.getStringList(path + ".banned")) c.banned.add(UUID.fromString(s));
+                c.auditLogs.addAll(dataConfig.getStringList(path + ".logs"));
 
                 c.allowBuild = dataConfig.getBoolean(path + ".allowBuild", false);
                 c.allowContainers = dataConfig.getBoolean(path + ".allowContainers", false);
@@ -1392,6 +1596,11 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
                 c.allowRtpTeleport = dataConfig.getBoolean(path + ".allowRtpTeleport", true);
                 c.allowWindBurst = dataConfig.getBoolean(path + ".allowWindBurst", false);
                 c.allowBoats = dataConfig.getBoolean(path + ".allowBoats", false);
+                c.allowFly = dataConfig.getBoolean(path + ".allowFly", false);
+                c.alwaysBorder = dataConfig.getBoolean(path + ".alwaysBorder", false);
+                c.soundsEnabled = dataConfig.getBoolean(path + ".soundsEnabled", true);
+                c.claimRespawn = dataConfig.getBoolean(path + ".claimRespawn", false);
+                c.favorite = dataConfig.getBoolean(path + ".favorite", false);
 
                 claims.add(c);
             }
@@ -1414,12 +1623,14 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         UUID owner;
         String ownerName;
         String title;
+        Material icon = Material.ENDER_PEARL;
         String world;
         int minX, maxX, minZ, maxZ;
         Location home;
         Set<UUID> trusted = new HashSet<>();
         Map<UUID, MemberPerms> memberPerms = new HashMap<>();
         Set<UUID> banned = new HashSet<>();
+        List<String> auditLogs = new ArrayList<>();
 
         boolean allowBuild = false;
         boolean allowContainers = false;
@@ -1435,6 +1646,11 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
         boolean allowRtpTeleport = true;
         boolean allowWindBurst = false;
         boolean allowBoats = false;
+        boolean allowFly = false;
+        boolean alwaysBorder = false;
+        boolean soundsEnabled = true;
+        boolean claimRespawn = false;
+        boolean favorite = false;
 
         Claim(String id, UUID owner, String ownerName, Location l1, Location l2) {
             this(id, owner, ownerName, l1.getWorld().getName(),
@@ -1452,6 +1668,14 @@ public class LandClaimPlugin extends JavaPlugin implements Listener, TabComplete
             this.maxX = maxX;
             this.minZ = minZ;
             this.maxZ = maxZ;
+        }
+
+        void addLog(String text) {
+            String time = new SimpleDateFormat("HH:mm").format(new Date());
+            auditLogs.add("[" + time + "] " + text);
+            if (auditLogs.size() > 15) {
+                auditLogs.remove(0);
+            }
         }
 
         MemberPerms getMemberPerms(UUID uuid) {
